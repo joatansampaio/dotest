@@ -138,33 +138,38 @@ fn parse_cs_file(
     classes: &mut HashMap<String, String>,
 ) {
     let content = match std::fs::read_to_string(path) { Ok(c) => c, Err(_) => return };
+    parse_cs_content(&content, dir_str, methods, classes);
+}
 
+pub(crate) fn parse_cs_content(
+    content: &str, dir_str: &str,
+    methods: &mut HashMap<String, (String, String)>,
+    classes: &mut HashMap<String, String>,
+) {
     let mut current_class: Option<String> = None;
     let mut has_test_attr = false;
 
     for line in content.lines() {
         let trimmed = line.trim();
+        if trimmed.is_empty() { continue; }
+
+        let stripped = strip_attributes(trimmed);
+
+        if is_test_attribute(trimmed) {
+            has_test_attr = true;
+        }
 
         // Track class declarations
-        if let Some(cls) = extract_class_name(trimmed) {
+        if let Some(cls) = extract_class_name(stripped) {
             current_class = Some(cls.clone());
             classes.entry(cls).or_insert_with(|| dir_str.to_string());
             continue;
         }
 
-        // Detect test attributes
-        if is_test_attribute(trimmed) {
-            has_test_attr = true;
-            continue;
-        }
-
-        // If we just saw a test attribute, try to grab the method name
         if has_test_attr {
-            // Skip additional attributes stacked on top
-            if trimmed.starts_with('[') { continue; }
-            if trimmed.is_empty() { continue; }
+            if stripped.is_empty() { continue; }
 
-            if let Some(method_name) = extract_method_name(trimmed) {
+            if let Some(method_name) = extract_method_name(stripped) {
                 if let Some(ref cls) = current_class {
                     methods.entry(method_name)
                         .or_insert_with(|| (dir_str.to_string(), cls.clone()));
@@ -173,6 +178,46 @@ fn parse_cs_file(
             has_test_attr = false;
         }
     }
+}
+
+pub(crate) fn strip_attributes(mut s: &str) -> &str {
+    while s.starts_with('[') {
+        let mut depth = 0;
+        let mut end_idx = None;
+        let mut in_string = false;
+        let mut escape = false;
+
+        for (i, c) in s.char_indices() {
+             if escape {
+                 escape = false;
+                 continue;
+             }
+             if c == '\\' {
+                 escape = true;
+                 continue;
+             }
+             if c == '"' {
+                 in_string = !in_string;
+             } else if !in_string {
+                 if c == '[' {
+                     depth += 1;
+                 } else if c == ']' {
+                     depth -= 1;
+                     if depth == 0 {
+                         end_idx = Some(i);
+                         break;
+                     }
+                 }
+             }
+        }
+        
+        if let Some(i) = end_idx {
+            s = s[i + 1..].trim();
+        } else {
+            break; // Unmatched '['
+        }
+    }
+    s
 }
 
 pub(crate) fn is_test_attribute(line: &str) -> bool {

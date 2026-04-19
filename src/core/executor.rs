@@ -68,23 +68,42 @@ pub(crate) fn enrich(
             }
         }
 
-        // Multi‐segment -> e.g. "ClassName.MethodName" or "Outer.Inner.Method"
-        // Try to look up first segment as a class to get its folder prefix.
+        // Multi‐segment -> e.g. "Namespace.ClassName.MethodName" or "Ns.Sub.Class.Method"
+        // Scan segments to find a known class name and strip the namespace prefix.
         _ => {
-            let first = parts[0];
-            if let Some(folder) = class_map.get(first) {
+            // Try to find a known class name among the segments.
+            // Walk from left to right; the first matching segment is the class.
+            let mut class_idx: Option<usize> = None;
+            for (i, &seg) in parts.iter().enumerate() {
+                if class_map.contains_key(seg) {
+                    class_idx = Some(i);
+                    break;
+                }
+            }
+
+            if let Some(ci) = class_idx {
+                // Everything from the class segment onward is kept
+                let suffix = parts[ci..].join(".");
+                let folder = &class_map[parts[ci]];
                 if folder.is_empty() {
-                    base.to_string()
+                    suffix
                 } else {
-                    format!("{}.{}", folder, base)
+                    format!("{}.{}", folder, suffix)
                 }
             } else {
-                // Fallback: try looking up the LAST segment as a method
+                // No class segment found. Try looking up the LAST segment as a method
+                // to at least find the folder.
                 let last = *parts.last().unwrap();
-                if let Some((folder, _class)) = method_map.get(last) {
-                    if !folder.is_empty() {
-                        // Only prepend folder if the first segment isn't already a directory segment
-                        // that's part of the enrichment
+                if let Some((folder, class)) = method_map.get(last) {
+                    // Find the class name in parts so we can strip namespace
+                    if let Some(ci) = parts.iter().position(|&s| s == class.as_str()) {
+                        let suffix = parts[ci..].join(".");
+                        if folder.is_empty() {
+                            suffix
+                        } else {
+                            format!("{}.{}", folder, suffix)
+                        }
+                    } else if !folder.is_empty() {
                         format!("{}.{}", folder, base)
                     } else {
                         base.to_string()
@@ -168,6 +187,8 @@ pub(crate) fn parse_cs_content(
 
         if has_test_attr {
             if stripped.is_empty() { continue; }
+            // Skip comment-only remainders (e.g. [Test] // url  ->  stripped = "// url")
+            if stripped.starts_with("//") { continue; }
 
             if let Some(method_name) = extract_method_name(stripped) {
                 if let Some(ref cls) = current_class {

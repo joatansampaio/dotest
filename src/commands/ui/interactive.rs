@@ -1,11 +1,8 @@
 use anyhow::Result;
-use crate::core::executor::{build_test_command, discover_tests};
+use crate::core::executor::discover_tests;
 use crate::core::tree::{build_flat_tree, TreeNode};
-use serde::{Deserialize, Serialize};
-use std::io::{self, BufRead};
-use std::process::Stdio;
+use std::io;
 use std::sync::mpsc;
-use std::thread;
 use std::time::Instant;
 
 use crossterm::{
@@ -15,257 +12,19 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Terminal,
 };
 
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
+use super::config::{RunConfig, Verbosity};
+use super::filter::{build_filter, sync_parents};
+use super::layout::{centered_rect, format_elapsed};
+use super::output::{kill_process, OutputEvent, spawn_test_run};
 
-// ─── Run config ──────────────────────────────────────────────────────────────
-
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
-enum Verbosity {
-    Minimal,
-    Normal,
-    Detailed,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-struct RunConfig {
-    no_build: bool,
-    verbosity: Verbosity,
-    cache_tests: bool,
-}
-
-impl Default for RunConfig {
-    fn default() -> Self {
-        RunConfig {
-            no_build: true,
-            verbosity: Verbosity::Normal,
-            cache_tests: false,
-        }
-    }
-}
-
-impl RunConfig {
-    fn load() -> Self {
-        if let Ok(s) = std::fs::read_to_string(".dotest.yml") {
-            if let Ok(cfg) = serde_yaml::from_str(&s) {
-                return cfg;
-            }
-        }
-        RunConfig::default()
-    }
-    
-    fn save(&self) {
-        if let Ok(s) = serde_yaml::to_string(self) {
-            let _ = std::fs::write(".dotest.yml", s);
-        }
-    }
-}
-
-pub fn run() -> Result<()> {
-    let config = RunConfig::load();
-    
-    let tests = if config.cache_tests {
-        if let Ok(s) = std::fs::read_to_string(".dotest_cache.json") {
-            if let Ok(cached) = serde_json::from_str::<Vec<(String, String, usize)>>(&s) {
-                if cached.is_empty() {
-                    discover_and_cache()?
-                } else {
-                    cached
-                }
-            } else {
-                discover_and_cache()?
-            }
-        } else {
-            discover_and_cache()?
-        }
-    } else {
-        println!("Discovering tests (this may take a moment)...");
-        discover_tests(true)?
-    };
-
-    if tests.is_empty() {
-        println!("No tests found.");
-        return Ok(());
-    }
-    let mut tree = build_flat_tree(&tests);
-    run_interactive_loop(&mut tree, config)
-}
-
-fn discover_and_cache() -> Result<Vec<(String, String, usize)>> {
-    println!("Discovering tests (this may take a moment)...");
-    let tests = discover_tests(true)?;
-    if let Ok(s) = serde_json::to_string(&tests) {
-        let _ = std::fs::write(".dotest_cache.json", s);
-    }
-    Ok(tests)
-}
-
-// ─── Filter ──────────────────────────────────────────────────────────────────
-
-fn build_filter(tree: &[TreeNode]) -> Option<String> {
-    let mut any_selected = false;
-    let mut all_selected = true;
-    for node in tree.iter().filter(|n| n.is_leaf) {
-        if node.is_selected { any_selected = true; }
-        else { all_selected = false; }
-    }
-
-    if !any_selected { return None; }
-    if all_selected { return Some(String::new()); }
-
-    let mut include_nodes = Vec::new();
-    for node in tree.iter() {
-        if node.is_selected {
-            let parent_is_selected = node.parent_idx.map_or(false, |pid| tree[pid].is_selected);
-            if !parent_is_selected {
-                if let Some(fqn) = node.fqn.as_deref() {
-                    let pat = if node.is_leaf {
-                        fqn.to_string()
-                    } else if fqn.ends_with('.') {
-                        fqn.to_string()
-                    } else {
-                        format!("{}.", fqn)
-                    };
-                    include_nodes.push(format!("FullyQualifiedName~{}", pat));
-                }
-            }
-        }
-    }
-    let include_str = include_nodes.join("|");
-
-    let exclude_str = tree.iter()
-        .filter(|n| n.is_leaf && !n.is_selected)
-        .filter_map(|n| n.fqn.as_deref())
-        .map(|t| format!("FullyQualifiedName!~{}", t))
-        .collect::<Vec<_>>()
-        .join("&");
-
-    if !exclude_str.is_empty() && exclude_str.len() < include_str.len() {
-        Some(exclude_str)
-    } else {
-        Some(include_str)
-    }
-}
-
-// ─── Parent sync ─────────────────────────────────────────────────────────────
-
-fn sync_parents(tree: &mut Vec<TreeNode>) {
-    for i in (0..tree.len()).rev() {
-        if tree[i].is_leaf { continue; }
-        let mut all = true;
-        let mut j = i + 1;
-        while j < tree.len() && tree[j].depth > tree[i].depth {
-            if tree[j].is_leaf && !tree[j].is_selected { all = false; break; }
-            j += 1;
-        }
-        tree[i].is_selected = all;
-    }
-}
-
-// ─── Output events ──────────────────────────────────────────────────────────
-
-enum OutputEvent {
-    Line(String),
-    Finished(Option<i32>),
-}
-
-fn spawn_test_run(filter: Option<String>, config: &RunConfig) -> Result<(mpsc::Receiver<OutputEvent>, u32)> {
-    let (tx, rx) = mpsc::channel();
-
-    let filter_arg = match filter.as_deref() {
-        Some("") | None => None,
-        Some(f) if f.len() > 31000 => {
-            let _ = tx.send(OutputEvent::Line(
-                "⚠ Filter too long for Windows. Running ALL tests instead.".to_string()
-            ));
-            let _ = tx.send(OutputEvent::Line(String::new()));
-            None
-        }
-        _ => filter,
-    };
-
-    let mut cmd = build_test_command(filter_arg, config.no_build);
-    // Keep MSBuild output minimal to avoid noise
-    cmd.arg("-v").arg("m");
-
-    match config.verbosity {
-        Verbosity::Minimal => {
-            cmd.arg("--logger").arg("console");
-        }
-        Verbosity::Normal => {
-            cmd.arg("--logger").arg("console;verbosity=normal");
-        }
-        Verbosity::Detailed => {
-            cmd.arg("--logger").arg("console;verbosity=detailed");
-        }
-    }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-
-    let mut child = cmd.spawn()?;
-    let pid = child.id();
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-
-    let tx2 = tx.clone();
-    let tx3 = tx.clone();
-
-    thread::spawn(move || {
-        for line in io::BufReader::new(stdout).lines().flatten() {
-            if tx.send(OutputEvent::Line(line)).is_err() { break; }
-        }
-    });
-    thread::spawn(move || {
-        for line in io::BufReader::new(stderr).lines().flatten() {
-            if tx2.send(OutputEvent::Line(line)).is_err() { break; }
-        }
-    });
-    thread::spawn(move || {
-        let code = child.wait().ok().and_then(|s| s.code());
-        let _ = tx3.send(OutputEvent::Finished(code));
-    });
-
-    Ok((rx, pid))
-}
-
-fn kill_process(pid: u32) {
-    #[cfg(windows)]
-    {
-        let mut cmd = std::process::Command::new("taskkill");
-        cmd.args(["/F", "/T", "/PID", &pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        let _ = cmd.spawn();
-    }
-    #[cfg(not(windows))]
-    {
-        unsafe { libc::kill(pid as i32, libc::SIGTERM); }
-    }
-}
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-fn format_elapsed(d: std::time::Duration) -> String {
-    let s = d.as_secs();
-    format!("{}:{:02}", s / 60, s % 60)
-}
-
-fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
-    let x = area.x + area.width.saturating_sub(width) / 2;
-    let y = area.y + area.height.saturating_sub(height) / 2;
-    Rect::new(x, y, width.min(area.width), height.min(area.height))
-}
-
-// ─── Main loop ───────────────────────────────────────────────────────────────
-
-fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: RunConfig) -> Result<()> {
+pub(super) fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: RunConfig) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -276,7 +35,6 @@ fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: RunConfig) -> 
     state.select(Some(0));
     let mut search_query = String::new();
 
-    // Output state
     let mut output_lines: Vec<String> = Vec::new();
     let mut output_rx: Option<mpsc::Receiver<OutputEvent>> = None;
     let mut is_running = false;
@@ -287,19 +45,17 @@ fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: RunConfig) -> 
     let mut run_failed = 0;
     let mut run_skipped = 0;
 
-    // Config & Help states
     let mut show_config = false;
     let mut config_cursor: usize = 0;
     let mut show_help = false;
 
     loop {
-        // ── Drain output channel ────────────────────────────────────────
         if let Some(ref rx) = output_rx {
             loop {
                 match rx.try_recv() {
                     Ok(OutputEvent::Line(line)) => {
                         let trimmed = line.trim();
-                        
+
                         if trimmed.starts_with("Passed ") || trimmed.starts_with('✓') {
                             run_passed += 1;
                         } else if trimmed.starts_with("Failed ") || trimmed.starts_with('✗') {
@@ -307,7 +63,7 @@ fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: RunConfig) -> 
                         } else if trimmed.starts_with("Skipped ") || trimmed.starts_with('⚠') {
                             run_skipped += 1;
                         }
-                        
+
                         let line_lower = trimmed.to_lowercase();
                         if let Some(pos) = line_lower.find("passed:") {
                             let rest = line_lower[pos + 7..].trim_start();
@@ -324,16 +80,16 @@ fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: RunConfig) -> 
                             let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
                             if let Ok(n) = num_str.parse::<usize>() { run_skipped = n; }
                         }
-                        
+
                         output_lines.push(line);
                     }
                     Ok(OutputEvent::Finished(code)) => {
                         is_running = false;
                         let elapsed = run_start.map(|s| format_elapsed(s.elapsed())).unwrap_or_default();
-                        
+
                         output_lines.push(String::new());
                         output_lines.push("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
-                        
+
                         let total = run_passed + run_failed + run_skipped;
                         let mut summary = format!("  Test Run Summary ({} total)", total);
                         if run_passed > 0 { summary.push_str(&format!("  |  ✓ {} Passed", run_passed)); }
@@ -364,7 +120,6 @@ fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: RunConfig) -> 
             }
         }
 
-        // ── Visibility logic ────────────────────────────────────────────
         let query = search_query.to_lowercase();
         let mut matches_query = vec![false; tree.len()];
         if query.is_empty() {
@@ -405,7 +160,6 @@ fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: RunConfig) -> 
         let selected_count: usize = tree.iter().filter(|n| n.is_leaf && n.is_selected).map(|n| n.test_count).sum();
         let total_count: usize = tree.iter().filter(|n| n.is_leaf).map(|n| n.test_count).sum();
 
-        // ── Draw ────────────────────────────────────────────────────────
         let has_output = !output_lines.is_empty();
 
         terminal.draw(|f| {
@@ -422,7 +176,6 @@ fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: RunConfig) -> 
                 .constraints(constraints)
                 .split(area);
 
-            // ── Tree pane ───────────────────────────────────────────
             let mut items = Vec::new();
             for (display_idx, &real_idx) in visible_indices.iter().enumerate() {
                 let node = &tree[real_idx];
@@ -455,7 +208,6 @@ fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: RunConfig) -> 
                 .block(Block::default().title(title).borders(Borders::ALL));
             f.render_stateful_widget(list, chunks[0], &mut state);
 
-            // ── Output pane ─────────────────────────────────────────
             if has_output {
                 let output_height = chunks[1].height.saturating_sub(2) as usize;
                 output_scroll = output_lines.len().saturating_sub(output_height) as u16;
@@ -495,7 +247,6 @@ fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: RunConfig) -> 
                 f.render_widget(output_widget, chunks[1]);
             }
 
-            // ── Status bar ──────────────────────────────────────────
             let help_text = if !search_query.is_empty() {
                 format!(" Search: {}  |  Esc: clear  Enter: run  ?: help ", search_query)
             } else if is_running {
@@ -514,7 +265,6 @@ fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: RunConfig) -> 
                 .block(Block::default().borders(Borders::ALL));
             f.render_widget(help, chunks[2]);
 
-            // ── Config popup ────────────────────────────────────────
             if show_config {
                 let popup = centered_rect(54, 10, area);
                 f.render_widget(Clear, popup);
@@ -550,11 +300,11 @@ fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: RunConfig) -> 
                         .border_style(Style::default().fg(Color::Cyan)));
                 f.render_widget(config_widget, popup);
             }
-            
+
             if show_help {
                 let popup = centered_rect(60, 20, area);
                 f.render_widget(Clear, popup);
-                
+
                 let help_lines = vec![
                     Line::from(Span::styled(" Navigation", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
                     Line::from("  ↑/↓       : Move selection"),
@@ -599,8 +349,8 @@ fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: RunConfig) -> 
 
                 if show_config {
                     match key.code {
-                        KeyCode::Esc | KeyCode::Enter => { 
-                            show_config = false; 
+                        KeyCode::Esc | KeyCode::Enter => {
+                            show_config = false;
                             run_config.save();
                         }
                         KeyCode::Up => { if config_cursor > 0 { config_cursor -= 1; } }
@@ -616,8 +366,7 @@ fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: RunConfig) -> 
                                     if !run_config.cache_tests {
                                         let _ = std::fs::remove_file(".dotest_cache.json");
                                     } else {
-                                        // Cache it right away if toggled on
-                                        discover_and_cache().ok();
+                                        super::discover_and_cache().ok();
                                     }
                                 }
                                 _ => {}
@@ -642,7 +391,6 @@ fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: RunConfig) -> 
                     continue;
                 }
 
-                // Global Shortcuts
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a') {
                     let any_leaf_selected = tree.iter().any(|n| n.is_leaf && n.is_selected);
                     let to_state = !any_leaf_selected;
@@ -655,11 +403,11 @@ fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: RunConfig) -> 
                     config_cursor = 0;
                     continue;
                 }
-                
+
                 if key.code == KeyCode::F(5) {
                     output_lines.push("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
                     output_lines.push("🔄 Rediscovering tests... please wait.".to_string());
-                    
+
                     if let Ok(tests) = discover_tests(true) {
                         if run_config.cache_tests {
                             if let Ok(s) = serde_json::to_string(&tests) {
@@ -676,7 +424,7 @@ fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: RunConfig) -> 
                     }
                     continue;
                 }
-                
+
                 if key.code == KeyCode::Char('?') || key.code == KeyCode::F(1) {
                     show_help = true;
                     continue;
@@ -688,7 +436,7 @@ fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: RunConfig) -> 
                             search_query.clear();
                             state.select(Some(0));
                         } else {
-                            break; // quit
+                            break;
                         }
                     }
 

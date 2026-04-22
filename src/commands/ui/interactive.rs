@@ -1,6 +1,7 @@
 use anyhow::Result;
 use crate::core::executor::discover_tests;
 use crate::core::tree::{build_flat_tree, TreeNode};
+use arboard::Clipboard;
 use std::io;
 use std::sync::mpsc;
 use std::time::Instant;
@@ -24,6 +25,66 @@ use super::filter::{build_filter, sync_parents};
 use super::layout::{centered_rect, format_elapsed};
 use super::output::{kill_process, OutputEvent, spawn_test_run};
 
+#[derive(Clone, Debug, Default)]
+struct FailedTestInfo {
+    name: String,
+    details: Vec<String>,
+}
+
+fn is_status_result_line(trimmed: &str) -> bool {
+    trimmed.starts_with("Passed ")
+        || trimmed.starts_with("Failed ")
+        || trimmed.starts_with("Skipped ")
+        || trimmed.starts_with('✓')
+        || trimmed.starts_with('✗')
+        || trimmed.starts_with('⚠')
+}
+
+fn extract_failed_tests(lines: &[String]) -> Vec<FailedTestInfo> {
+    let mut failed: Vec<FailedTestInfo> = Vec::new();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let trimmed = lines[i].trim();
+        if trimmed.starts_with("Failed ") {
+            let after = trimmed.trim_start_matches("Failed ").trim();
+            let name = after.split(" [").next().unwrap_or(after).trim().to_string();
+            if name.is_empty() {
+                i += 1;
+                continue;
+            }
+
+            let mut details = Vec::new();
+            let mut j = i + 1;
+            while j < lines.len() {
+                let next_trimmed = lines[j].trim();
+                let lower = next_trimmed.to_lowercase();
+                if is_status_result_line(next_trimmed)
+                    || lower.starts_with("total tests:")
+                    || lower.starts_with("passed:")
+                    || lower.starts_with("failed:")
+                    || lower.starts_with("skipped:")
+                {
+                    break;
+                }
+                details.push(lines[j].clone());
+                j += 1;
+            }
+
+            if let Some(existing) = failed.iter_mut().find(|f| f.name == name) {
+                if existing.details.is_empty() && !details.is_empty() {
+                    existing.details = details;
+                }
+            } else {
+                failed.push(FailedTestInfo { name, details });
+            }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    failed
+}
+
 pub(super) fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: RunConfig) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -45,6 +106,10 @@ pub(super) fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: Run
     let mut run_passed = 0;
     let mut run_failed = 0;
     let mut run_skipped = 0;
+    let mut failed_tests: Vec<FailedTestInfo> = Vec::new();
+    let mut show_failure_summary = false;
+    let mut failed_selection: usize = 0;
+    let mut failed_detail_scroll: u16 = 0;
 
     let mut show_config = false;
     let mut config_cursor: usize = 0;
@@ -106,6 +171,12 @@ pub(super) fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: Run
                         };
                         output_lines.push(msg);
                         output_lines.push("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
+                        failed_tests = extract_failed_tests(&output_lines);
+                        if run_failed > 0 && !failed_tests.is_empty() {
+                            show_failure_summary = true;
+                            failed_selection = 0;
+                            failed_detail_scroll = 0;
+                        }
                         run_pid = None;
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
@@ -296,7 +367,12 @@ pub(super) fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: Run
                 let elapsed = run_start.map(|s| format_elapsed(s.elapsed())).unwrap_or_default();
                 format!(" Running... {}  |  PgUp/PgDn/Home/End: output scroll  Esc: cancel ", elapsed)
             } else {
-                " Arrows: nav  Space: toggle  Enter: run  PgUp/PgDn/Home/End: output scroll  ?: help  Esc: quit ".to_string()
+                let mut text = " Arrows: nav  Space: toggle  Enter: run  PgUp/PgDn/Home/End: output scroll ".to_string();
+                if !failed_tests.is_empty() && run_failed > 0 {
+                    text.push_str("  Ctrl+E: failed summary ");
+                }
+                text.push_str(" ?: help  Esc: quit ");
+                text
             };
 
             let help = Paragraph::new(help_text)
@@ -362,6 +438,7 @@ pub(super) fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: Run
                     Line::from(Span::styled(" Execution & Toggles", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
                     Line::from("  Space     : Toggle selection for hovered test/folder"),
                     Line::from("  Ctrl+A    : Toggle entirely all visible tests"),
+                    Line::from("  Ctrl+E    : Open failed tests summary (after a failed run)"),
                     Line::from("  Enter     : Run selected tests"),
                     Line::from("  Esc       : Cancel a running test execution"),
                     Line::from("  Esc       : Exit fullscreen output when run is finished"),
@@ -380,11 +457,125 @@ pub(super) fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: Run
                         .border_style(Style::default().fg(Color::Yellow)));
                 f.render_widget(help_widget, popup);
             }
+
+            if show_failure_summary {
+                let popup = centered_rect(88, 76, area);
+                f.render_widget(Clear, popup);
+                f.render_widget(
+                    Block::default()
+                        .title(" Failed Tests Summary ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Red)),
+                    popup,
+                );
+
+                let inner = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints(vec![Constraint::Min(0), Constraint::Length(2)])
+                    .split(popup);
+
+                let body = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints(vec![Constraint::Percentage(40), Constraint::Percentage(60)])
+                    .split(inner[0]);
+
+                let mut failed_items: Vec<ListItem> = Vec::new();
+                if failed_tests.is_empty() {
+                    failed_items.push(ListItem::new(Line::from(Span::styled(
+                        "No failed tests captured.",
+                        Style::default().fg(Color::DarkGray),
+                    ))));
+                } else {
+                    for (idx, failed) in failed_tests.iter().enumerate() {
+                        let style = if idx == failed_selection {
+                            Style::default().bg(Color::DarkGray).fg(Color::White).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::Red)
+                        };
+                        failed_items.push(ListItem::new(Line::from(Span::styled(
+                            failed.name.clone(),
+                            style,
+                        ))));
+                    }
+                }
+
+                let mut failed_state = ListState::default();
+                if !failed_tests.is_empty() {
+                    failed_state.select(Some(failed_selection.min(failed_tests.len().saturating_sub(1))));
+                }
+
+                let failed_list = List::new(failed_items).block(
+                    Block::default()
+                        .title(" Failed Tests ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Red)),
+                );
+                f.render_stateful_widget(failed_list, body[0], &mut failed_state);
+
+                let details: Vec<Line> = if failed_tests.is_empty() {
+                    vec![Line::from(Span::styled(
+                        "No details available.",
+                        Style::default().fg(Color::DarkGray),
+                    ))]
+                } else {
+                    let selected = &failed_tests[failed_selection.min(failed_tests.len() - 1)];
+                    if selected.details.is_empty() {
+                        vec![Line::from(Span::styled(
+                            "(No details captured for this test.)",
+                            Style::default().fg(Color::DarkGray),
+                        ))]
+                    } else {
+                        selected
+                            .details
+                            .iter()
+                            .map(|line| {
+                                let style = if line.contains("Error Message:") {
+                                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                                } else if line.contains("Stack Trace:") {
+                                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                                } else {
+                                    Style::default().fg(Color::White)
+                                };
+                                Line::from(Span::styled(line.clone(), style))
+                            })
+                            .collect()
+                    }
+                };
+
+                let detail_widget = Paragraph::new(details)
+                    .block(
+                        Block::default()
+                            .title(" Error Details ")
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::Red)),
+                    )
+                    .wrap(Wrap { trim: false })
+                    .scroll((failed_detail_scroll, 0));
+                f.render_widget(detail_widget, body[1]);
+
+                let footer = Paragraph::new(
+                    " ↑/↓: select failed test  PgUp/PgDn/Home/End: scroll details  c: copy all names  Esc: close ",
+                )
+                .style(Style::default().fg(Color::Red));
+                f.render_widget(footer, inner[1]);
+            }
         })?;
 
         if event::poll(std::time::Duration::from_millis(50))? {
             match event::read()? {
                 Event::Mouse(mouse) => {
+                    if show_failure_summary {
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp => {
+                                failed_detail_scroll = failed_detail_scroll.saturating_sub(3);
+                            }
+                            MouseEventKind::ScrollDown => {
+                                failed_detail_scroll = failed_detail_scroll.saturating_add(3);
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
                     if show_output_panel {
                         match mouse.kind {
                             MouseEventKind::ScrollUp => {
@@ -406,6 +597,53 @@ pub(super) fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: Run
                 if show_help {
                     match key.code {
                         KeyCode::Esc | KeyCode::Enter => { show_help = false; }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                if show_failure_summary {
+                    match key.code {
+                        KeyCode::Esc => {
+                            show_failure_summary = false;
+                        }
+                        KeyCode::Up => {
+                            if !failed_tests.is_empty() {
+                                failed_selection = failed_selection.saturating_sub(1);
+                                failed_detail_scroll = 0;
+                            }
+                        }
+                        KeyCode::Down => {
+                            if !failed_tests.is_empty() {
+                                failed_selection = (failed_selection + 1).min(failed_tests.len() - 1);
+                                failed_detail_scroll = 0;
+                            }
+                        }
+                        KeyCode::PageUp => {
+                            failed_detail_scroll = failed_detail_scroll.saturating_sub(5);
+                        }
+                        KeyCode::PageDown => {
+                            failed_detail_scroll = failed_detail_scroll.saturating_add(5);
+                        }
+                        KeyCode::Home => {
+                            failed_detail_scroll = 0;
+                        }
+                        KeyCode::End => {
+                            failed_detail_scroll = u16::MAX;
+                        }
+                        KeyCode::Char('c') => {
+                            if !failed_tests.is_empty() {
+                                let names = failed_tests
+                                    .iter()
+                                    .map(|f| f.name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                match Clipboard::new().and_then(|mut cb| cb.set_text(names)) {
+                                    Ok(_) => output_lines.push("✓ Copied failed test names to clipboard.".to_string()),
+                                    Err(_) => output_lines.push("✗ Could not copy failed test names to clipboard.".to_string()),
+                                }
+                            }
+                        }
                         _ => {}
                     }
                     continue;
@@ -525,6 +763,15 @@ pub(super) fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: Run
                     continue;
                 }
 
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
+                    if !failed_tests.is_empty() && run_failed > 0 {
+                        show_failure_summary = true;
+                        failed_selection = failed_selection.min(failed_tests.len() - 1);
+                        failed_detail_scroll = 0;
+                    }
+                    continue;
+                }
+
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
                     show_config = true;
                     config_cursor = 0;
@@ -613,6 +860,10 @@ pub(super) fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: Run
                                     run_passed = 0;
                                     run_failed = 0;
                                     run_skipped = 0;
+                                    failed_tests.clear();
+                                    show_failure_summary = false;
+                                    failed_selection = 0;
+                                    failed_detail_scroll = 0;
                                 }
                                 Err(e) => {
                                     output_lines.push(format!("Error: {}", e));

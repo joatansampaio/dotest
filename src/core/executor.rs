@@ -9,8 +9,8 @@ use crate::core::config::Config;
 /// Returns `(tree_fqn, filter_key, test_count)` triples.
 /// `filter_key` is a VSTest-friendly substring for `FullyQualifiedName~` (typically `Namespace.Class.Method`).
 /// `test_count` is the number of `dotnet test -t` lines for that logical test method.
-pub fn discover_tests(no_build: bool) -> Result<Vec<(String, String, usize)>> {
-    let display_names = discover_display_names(no_build)?;
+pub fn discover_tests(no_build: bool, no_restore: bool) -> Result<Vec<(String, String, usize)>> {
+    let display_names = discover_display_names(no_build, no_restore)?;
     if display_names.is_empty() {
         return Ok(Vec::new());
     }
@@ -540,10 +540,11 @@ fn collect_csproj(dir: &Path, depth: usize, out: &mut Vec<std::path::PathBuf>) {
     }
 }
 
-fn discover_display_names(no_build: bool) -> Result<Vec<String>> {
+fn discover_display_names(no_build: bool, no_restore: bool) -> Result<Vec<String>> {
     let mut cmd = Command::new("dotnet");
     cmd.arg("test").arg("-t");
     if no_build { cmd.arg("--no-build"); }
+    if no_restore { cmd.arg("--no-restore"); }
     let output = cmd.output().context("Failed to run dotnet test -t")?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut tests = Vec::new();
@@ -571,7 +572,7 @@ fn discover_display_names(no_build: bool) -> Result<Vec<String>> {
 
 /// Build a `dotnet test` Command with filter and config exclusions applied.
 /// Caller controls Stdio (piped vs inherited).
-pub fn build_test_command(filter: Option<String>, no_build: bool) -> Command {
+pub fn build_test_command(filter: Option<String>, no_build: bool, no_restore: bool) -> Command {
     let mut cmd = Command::new("dotnet");
     cmd.arg("test");
 
@@ -593,5 +594,6 @@ pub fn build_test_command(filter: Option<String>, no_build: bool) -> Command {
 
     if let Some(f) = final_filter { cmd.arg("--filter"); cmd.arg(f); }
     if no_build { cmd.arg("--no-build"); }
+    if no_restore { cmd.arg("--no-restore"); }
     cmd
 }

@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
+use crate::commands::ui::config::RunConfig;
 use crate::core::count::{resolve_short_segment_to_prefix, sum_for_count_query, tree_under_prefix};
 use crate::core::executor::discover_tests;
 
 pub fn run(folder: String, no_build: bool) -> Result<()> {
-    let tests = discover_tests(no_build)?;
+    let run_config = RunConfig::load();
+    let tests = discover_tests(no_build, run_config.no_restore)?;
     let (ptrim, sum, buckets) = if folder.contains('.') {
         let p = folder.trim().trim_end_matches('.').to_string();
         let s = sum_for_count_query(&tests, &folder);

@@ -539,7 +539,7 @@ pub(super) fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: Run
             f.render_widget(help, chunks[help_chunk_idx]);
 
             if show_config {
-                let popup = centered_rect(64, 22, area);
+                let popup = centered_rect(64, 23, area);
                 f.render_widget(Clear, popup);
 
                 let v_label = match run_config.verbosity {
@@ -563,6 +563,10 @@ pub(super) fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: Run
                         "  {}  Skip build  (--no-build)",
                         if run_config.no_build { "[x]" } else { "[ ]" }
                     ),
+                    format!(
+                        "  {}  Skip restore  (--no-restore)",
+                        if run_config.no_restore { "[x]" } else { "[ ]" }
+                    ),
                     format!("  [∙]  Log verbosity:  {v_label}  (Space: cycle)"),
                     format!(
                         "  {}  Cache discovered tests  (F5 refresh)",
@@ -585,7 +589,7 @@ pub(super) fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: Run
                 }
                 config_lines.push(Line::from(""));
                 config_lines.push(Line::from(Span::styled(
-                    "  ↑/↓: move   Space: change row   ←/→: debounce 200 ms (row 5)   Esc / Enter: save & close",
+                    "  ↑/↓: move   Space: change row   ←/→: debounce 200 ms (row 6)   Esc / Enter: save & close",
                     Style::default().fg(Color::DarkGray),
                 )));
                 config_lines.push(Line::from(""));
@@ -915,19 +919,19 @@ pub(super) fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: Run
                             }
                         }
                         KeyCode::Down => {
-                            if config_cursor < 5 {
+                            if config_cursor < 6 {
                                 config_cursor += 1;
                             }
                         }
                         KeyCode::Left => {
-                            if config_cursor == 5 {
+                            if config_cursor == 6 {
                                 run_config.manual_watch_delay_ms = debounce_clamp(
                                     run_config.manual_watch_delay_ms.saturating_sub(200),
                                 );
                             }
                         }
                         KeyCode::Right => {
-                            if config_cursor == 5 {
+                            if config_cursor == 6 {
                                 run_config.manual_watch_delay_ms = debounce_clamp(
                                     (run_config.manual_watch_delay_ms + 200).min(20_000),
                                 );
@@ -936,29 +940,30 @@ pub(super) fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: Run
                         KeyCode::Char(' ') => {
                             match config_cursor {
                                 0 => run_config.no_build = !run_config.no_build,
-                                1 => {
+                                1 => run_config.no_restore = !run_config.no_restore,
+                                2 => {
                                     run_config.verbosity = match run_config.verbosity {
                                         Verbosity::Normal => Verbosity::Detailed,
                                         Verbosity::Detailed => Verbosity::Minimal,
                                         Verbosity::Minimal => Verbosity::Normal,
                                     };
                                 }
-                                2 => {
+                                3 => {
                                     run_config.cache_tests = !run_config.cache_tests;
                                     if !run_config.cache_tests {
                                         let _ = std::fs::remove_file(".dotest_cache.json");
                                     } else {
-                                        super::discover_and_cache().ok();
+                                        super::discover_and_cache(run_config.no_restore).ok();
                                     }
                                 }
-                                3 => {
+                                4 => {
                                     run_config.output_mode = if run_config.output_mode == OutputMode::Split {
                                         OutputMode::Fullscreen
                                     } else {
                                         OutputMode::Split
                                     };
                                 }
-                                4 => {
+                                5 => {
                                     run_config.manual_watch_enabled = !run_config.manual_watch_enabled;
                                     run_config.manual_watch_delay_ms = debounce_clamp(run_config.manual_watch_delay_ms);
                                     apply_manual_watch_config(
@@ -967,7 +972,7 @@ pub(super) fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: Run
                                         &mut manual_watch_handle,
                                     );
                                 }
-                                5 => {}
+                                6 => {}
                                 _ => {}
                             }
                         }
@@ -1077,7 +1082,7 @@ pub(super) fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: Run
                     output_lines.push("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
                     output_lines.push("🔄 Rediscovering tests... please wait.".to_string());
 
-                    if let Ok(tests) = discover_tests(true) {
+                    if let Ok(tests) = discover_tests(true, run_config.no_restore) {
                         if run_config.cache_tests {
                             if let Ok(s) = serde_json::to_string(&tests) {
                                 let _ = std::fs::write(".dotest_cache.json", s);

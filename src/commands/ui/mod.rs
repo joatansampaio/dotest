@@ -2,7 +2,7 @@ use anyhow::Result;
 use crate::core::executor::discover_tests;
 use crate::core::tree::build_flat_tree;
 
-mod config;
+pub(crate) mod config;
 mod filter;
 mod interactive;
 mod layout;
@@ -16,19 +16,19 @@ pub fn run() -> Result<()> {
         if let Ok(s) = std::fs::read_to_string(".dotest_cache.json") {
             if let Ok(cached) = serde_json::from_str::<Vec<(String, String, usize)>>(&s) {
                 if cached.is_empty() {
-                    discover_and_cache()?
+                    discover_and_cache(config.no_restore)?
                 } else {
                     cached
                 }
             } else {
-                discover_and_cache()?
+                discover_and_cache(config.no_restore)?
             }
         } else {
-            discover_and_cache()?
+            discover_and_cache(config.no_restore)?
         }
     } else {
         println!("Discovering tests (this may take a moment)...");
-        discover_tests(true)?
+        discover_tests(true, config.no_restore)?
     };
 
     if tests.is_empty() {
@@ -39,9 +39,9 @@ pub fn run() -> Result<()> {
     interactive::run_interactive_loop(&mut tree, config)
 }
 
-fn discover_and_cache() -> Result<Vec<(String, String, usize)>> {
+fn discover_and_cache(no_restore: bool) -> Result<Vec<(String, String, usize)>> {
     println!("Discovering tests (this may take a moment)...");
-    let tests = discover_tests(true)?;
+    let tests = discover_tests(true, no_restore)?;
     if let Ok(s) = serde_json::to_string(&tests) {
         let _ = std::fs::write(".dotest_cache.json", s);
     }

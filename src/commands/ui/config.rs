@@ -1,14 +1,14 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
-pub(super) enum Verbosity {
+pub(crate) enum Verbosity {
     Minimal,
     Normal,
     Detailed,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
-pub(super) enum OutputMode {
+pub(crate) enum OutputMode {
     Split,
     Fullscreen,
 }
@@ -21,9 +21,16 @@ fn default_manual_watch_delay_ms() -> u32 {
     2000
 }
 
+fn default_no_restore() -> bool {
+    true
+}
+
 #[derive(Serialize, Deserialize, Clone)]
-pub(super) struct RunConfig {
+pub(crate) struct RunConfig {
     pub no_build: bool,
+    /// When true (default), passes `--no-restore` to `dotnet test` (faster; skips implicit restore).
+    #[serde(default = "default_no_restore")]
+    pub no_restore: bool,
     pub verbosity: Verbosity,
     pub cache_tests: bool,
     #[serde(default = "default_output_mode")]
@@ -42,6 +49,7 @@ impl Default for RunConfig {
     fn default() -> Self {
         RunConfig {
             no_build: true,
+            no_restore: true,
             verbosity: Verbosity::Normal,
             cache_tests: false,
             output_mode: OutputMode::Split,
@@ -52,7 +60,7 @@ impl Default for RunConfig {
 }
 
 impl RunConfig {
-    pub(super) fn load() -> Self {
+    pub(crate) fn load() -> Self {
         if let Ok(s) = std::fs::read_to_string(".dotest.yml") {
             if let Ok(cfg) = serde_yaml::from_str(&s) {
                 return cfg;
@@ -61,7 +69,7 @@ impl RunConfig {
         RunConfig::default()
     }
 
-    pub(super) fn save(&self) {
+    pub(crate) fn save(&self) {
         if let Ok(s) = serde_yaml::to_string(self) {
             let _ = std::fs::write(".dotest.yml", s);
         }

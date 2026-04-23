@@ -30,7 +30,7 @@ pub(super) fn spawn_test_run(filter: Option<String>, config: &RunConfig) -> Resu
         _ => filter,
     };
 
-    let mut cmd = build_test_command(filter_arg, config.no_build);
+    let mut cmd = build_test_command(filter_arg, config.no_build, config.no_restore);
     cmd.arg("-v").arg("m");
 
     match config.verbosity {

@@ -769,7 +769,10 @@ fn resolve_test_target(no_prompt: bool) -> Result<Option<String>> {
 fn discover_display_names(no_build: bool, no_restore: bool) -> Result<Vec<String>> {
     let target = resolve_test_target(false)?;
     let mut cmd = Command::new("dotnet");
-    cmd.arg("test").arg("/p:UseSharedCompilation=true").arg("-t");
+    cmd.arg("test")
+        .arg("/p:UseSharedCompilation=true")
+        .arg("/p:BaseOutputPath=bin/dotest/")
+        .arg("-t");
     if let Some(target) = &target {
         cmd.arg(target);
     }
@@ -823,7 +826,7 @@ pub(crate) fn format_discovery_failure(
     no_restore: bool,
     target: Option<&str>,
 ) -> String {
-    let mut command = "dotnet test /p:UseSharedCompilation=true -t".to_string();
+    let mut command = "dotnet test /p:UseSharedCompilation=true /p:BaseOutputPath=bin/dotest/ -t".to_string();
     if let Some(target) = target {
         command.push(' ');
         command.push_str(target);
@@ -906,7 +909,9 @@ Choose another solution/project target, or clone the missing dependency repos.",
 /// Caller controls Stdio (piped vs inherited).
 pub fn build_test_command(filter: Option<String>, no_build: bool, no_restore: bool) -> Command {
     let mut cmd = Command::new("dotnet");
-    cmd.arg("test").arg("/p:UseSharedCompilation=true");
+    cmd.arg("test")
+        .arg("/p:UseSharedCompilation=true")
+        .arg("/p:BaseOutputPath=bin/dotest/");
     if let Ok(Some(target)) = resolve_test_target(true) {
         cmd.arg(target);
     }

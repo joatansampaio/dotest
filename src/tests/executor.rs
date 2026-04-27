@@ -53,7 +53,7 @@ Installed SDKs:
 
     let message = format_discovery_failure(Some(1), "", stderr, true, true, None);
 
-    assert!(message.contains("Test discovery failed while running `dotnet test /p:UseSharedCompilation=true -t --no-build --no-restore`"));
+    assert!(message.contains("Test discovery failed while running `dotnet test /p:UseSharedCompilation=true /p:BaseOutputPath=bin/dotest/ -t --no-build --no-restore`"));
     assert!(message.contains("The .NET SDK selected by global.json is not installed or cannot be used"));
     assert!(message.contains("Install the requested SDK, or update global.json"));
     assert!(message.contains("Requested SDK version: 7.0.101"));

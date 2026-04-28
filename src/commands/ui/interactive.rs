@@ -171,8 +171,11 @@ pub(super) fn run_interactive_loop(tree: &mut Vec<TreeNode>, mut run_config: Run
                 && !is_running
                 && !show_config
                 && !show_help
-                && !show_failure_summary
             {
+                if show_failure_summary {
+                    show_failure_summary = false;
+                    failure_detail_hover = None;
+                }
                 let filter = build_filter(tree);
                 match filter {
                     None => {

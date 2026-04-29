@@ -41,6 +41,9 @@ use super::layout::{
 };
 use super::output::{kill_process, OutputEvent};
 
+type DiscoveryEntries = Vec<(String, String, usize)>;
+type RediscoveryResult = std::result::Result<DiscoveryEntries, String>;
+
 /// Interactive TUI: test tree, run output, settings, and failure summary.
 pub(super) fn run_interactive_loop(
     tree: &mut Vec<TreeNode>,
@@ -58,11 +61,14 @@ pub(super) fn run_interactive_loop(
 
     let mut output_lines: Vec<String> = Vec::new();
     let mut output_rx: Option<mpsc::Receiver<OutputEvent>> = None;
+    let mut rediscovery_rx: Option<mpsc::Receiver<RediscoveryResult>> = None;
     let mut is_running = false;
+    let mut is_rediscovering = false;
     let mut output_scroll: u16 = 0;
     let mut output_follow_tail = true;
     let mut run_pid: Option<u32> = None;
     let mut run_start: Option<Instant> = None;
+    let mut rediscovery_start: Option<Instant> = None;
     let mut run_passed = 0;
     let mut run_failed = 0;
     let mut run_skipped = 0;
@@ -189,6 +195,38 @@ pub(super) fn run_interactive_loop(
                         }
                         break;
                     }
+                }
+            }
+        }
+
+        if let Some(ref rx) = rediscovery_rx {
+            match rx.try_recv() {
+                Ok(Ok(tests)) => {
+                    *tree = build_flat_tree(&tests);
+                    state.select(Some(0));
+                    search_query.clear();
+                    let total: usize = tests.iter().map(|(_, _, c)| c).sum();
+                    output_lines.push(format!(
+                        "✓ Found {} tests ({} methods).",
+                        total,
+                        tests.len()
+                    ));
+                    is_rediscovering = false;
+                    rediscovery_start = None;
+                    rediscovery_rx = None;
+                }
+                Ok(Err(error)) => {
+                    output_lines.push(format!("✗ Failed to discover tests: {error}"));
+                    is_rediscovering = false;
+                    rediscovery_start = None;
+                    rediscovery_rx = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    output_lines.push("✗ Failed to discover tests: worker stopped.".to_string());
+                    is_rediscovering = false;
+                    rediscovery_start = None;
+                    rediscovery_rx = None;
                 }
             }
         }
@@ -395,7 +433,12 @@ pub(super) fn run_interactive_loop(
             if show_output_panel {
                 let output_text = styled_output_lines(&output_lines);
 
-                let output_title = if is_running {
+                let output_title = if is_rediscovering {
+                    let elapsed = rediscovery_start
+                        .map(|s| format_elapsed(s.elapsed()))
+                        .unwrap_or_default();
+                    format!(" Output (Rediscovering... {}) [follow] ", elapsed)
+                } else if is_running {
                     let elapsed = run_start.map(|s| format_elapsed(s.elapsed())).unwrap_or_default();
                     if output_follow_tail {
                         format!(" Output (Running... {}) [follow]  |  ✓:{}  ✗:{}  ⚠:{} ", elapsed, run_passed, run_failed, run_skipped)
@@ -416,7 +459,7 @@ pub(super) fn run_interactive_loop(
                     .block(Block::default()
                         .title(output_title)
                         .borders(Borders::ALL)
-                        .border_style(if is_running {
+                        .border_style(if is_running || is_rediscovering {
                             Style::default().fg(Color::Yellow)
                         } else {
                             Style::default().fg(Color::DarkGray)
@@ -453,6 +496,14 @@ pub(super) fn run_interactive_loop(
                     " Running... {}  |  PgUp/PgDn/Home/End: output scroll  Ctrl+E: failed summary  Esc: cancel{}",
                     elapsed, watch_hint
                 )
+            } else if is_rediscovering {
+                let elapsed = rediscovery_start
+                    .map(|s| format_elapsed(s.elapsed()))
+                    .unwrap_or_default();
+                format!(
+                    " Rediscovering tests... {}  |  UI remains responsive{}",
+                    elapsed, watch_hint
+                )
             } else {
                 let mut text = " Arrows: nav  Space: toggle  Enter: run  PgUp/PgDn/Home/End: output scroll ".to_string();
                 if run_config.manual_watch_enabled {
@@ -465,7 +516,7 @@ pub(super) fn run_interactive_loop(
 
             let help = Paragraph::new(help_text)
                 .style(Style::default().fg(
-                    if is_running { Color::Yellow }
+                    if is_running || is_rediscovering { Color::Yellow }
                     else if !search_query.is_empty() { Color::Yellow }
                     else { Color::DarkGray }
                 ))
@@ -1221,6 +1272,11 @@ pub(super) fn run_interactive_loop(
                     }
 
                     if key.code == KeyCode::F(5) {
+                        if is_rediscovering {
+                            output_lines.push("Rediscovery is already running.".to_string());
+                            continue;
+                        }
+
                         output_lines.push(
                             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
                                 .to_string(),
@@ -1229,21 +1285,24 @@ pub(super) fn run_interactive_loop(
                             "🔄 Rediscovering tests (building if needed)... please wait."
                                 .to_string(),
                         );
+                        output_scroll = 0;
+                        output_follow_tail = true;
+                        show_output_fullscreen = run_config.output_mode == OutputMode::Fullscreen;
+                        is_rediscovering = true;
+                        rediscovery_start = Some(Instant::now());
 
-                        if let Ok(tests) = discover_tests(false, run_config.no_restore) {
-                            let _ = super::discovery_cache::save_discovery_cache(&tests);
-                            *tree = build_flat_tree(&tests);
-                            state.select(Some(0));
-                            search_query.clear();
-                            let total: usize = tests.iter().map(|(_, _, c)| c).sum();
-                            output_lines.push(format!(
-                                "✓ Found {} tests ({} methods).",
-                                total,
-                                tests.len()
-                            ));
-                        } else {
-                            output_lines.push("✗ Failed to discover tests.".to_string());
-                        }
+                        let no_restore = run_config.no_restore;
+                        let (tx, rx) = mpsc::channel();
+                        rediscovery_rx = Some(rx);
+                        std::thread::spawn(move || {
+                            let result = discover_tests(false, no_restore)
+                                .map(|tests| {
+                                    let _ = super::discovery_cache::save_discovery_cache(&tests);
+                                    tests
+                                })
+                                .map_err(|e| e.to_string());
+                            let _ = tx.send(result);
+                        });
                         continue;
                     }
 

@@ -7,6 +7,9 @@ pub struct TreeNode {
     /// None for folder / class (non-leaf) nodes.
     pub fqn: Option<String>,
     pub is_selected: bool,
+    /// True when this non-leaf node has *some* but not *all* leaf descendants selected.
+    /// Always false for leaf nodes.
+    pub is_partial: bool,
     pub is_expanded: bool,
     pub depth: usize,
     pub parent_idx: Option<usize>,
@@ -50,7 +53,8 @@ fn flatten_node(
         flat.push(TreeNode {
             label: label.clone(),
             fqn: Some(new_prefix.clone()),
-            is_selected: false, // <- default unselected
+            is_selected: false,
+            is_partial: false,
             is_expanded: false,
             depth,
             parent_idx,
@@ -65,7 +69,8 @@ fn flatten_node(
         flat.push(TreeNode {
             label: label.clone(),
             fqn: Some(filter_key.clone()),
-            is_selected: false, // <- default unselected
+            is_selected: false,
+            is_partial: false,
             is_expanded: true,
             depth,
             parent_idx,
@@ -182,13 +187,17 @@ fn truncate_to_dot_segments(s: &str, max_segments: usize) -> String {
 pub fn sync_parents(tree: &mut Vec<TreeNode>) {
     for i in (0..tree.len()).rev() {
         if tree[i].is_leaf { continue; }
+        let mut any = false;
         let mut all = true;
         let mut j = i + 1;
         while j < tree.len() && tree[j].depth > tree[i].depth {
-            if tree[j].is_leaf && !tree[j].is_selected { all = false; break; }
+            if tree[j].is_leaf {
+                if tree[j].is_selected { any = true; } else { all = false; }
+            }
             j += 1;
         }
         tree[i].is_selected = all;
+        tree[i].is_partial = any && !all;
     }
 }
 

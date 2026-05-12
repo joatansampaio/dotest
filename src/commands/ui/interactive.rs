@@ -427,7 +427,7 @@ pub(super) fn run_interactive_loop(
                     "  "
                 };
                 let indent = "  ".repeat(node.depth);
-                let check = if node.is_selected { "[x] " } else { "[ ] " };
+                let check = if node.is_selected { "[x] " } else if node.is_partial { "[~] " } else { "[ ] " };
                 let display_str = format!("{}{}{}{}", indent, prefix, check, node.label);
 
                 let style = if Some(display_idx) == state.selected() {
@@ -1515,6 +1515,7 @@ pub(super) fn run_interactive_loop(
                         let to_state = !any_leaf_selected;
                         for node in tree.iter_mut() {
                             node.is_selected = to_state;
+                            node.is_partial = false;
                         }
                         continue;
                     }

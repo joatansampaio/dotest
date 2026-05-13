@@ -34,6 +34,10 @@ fn default_no_restore() -> bool {
     true
 }
 
+fn default_confirm_exit_on_esc() -> bool {
+    true
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct RunConfig {
     pub no_build: bool,
@@ -55,6 +59,9 @@ pub(crate) struct RunConfig {
     pub manual_watch_enabled: bool,
     #[serde(default = "default_manual_watch_delay_ms")]
     pub manual_watch_delay_ms: u32,
+    /// When true (default), pressing Esc to quit the app first opens a confirmation dialog.
+    #[serde(default = "default_confirm_exit_on_esc")]
+    pub confirm_exit_on_esc: bool,
     #[serde(default)]
     pub presets: Vec<TestPreset>,
 }
@@ -69,6 +76,7 @@ impl Default for RunConfig {
             output_mode: OutputMode::Split,
             manual_watch_enabled: false,
             manual_watch_delay_ms: 2000,
+            confirm_exit_on_esc: true,
             presets: Vec::new(),
         }
     }

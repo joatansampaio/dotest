@@ -83,8 +83,10 @@ pub(super) fn run_interactive_loop(
     let mut failure_detail_hover: Option<usize> = None;
 
     let mut show_config = false;
-    // 0: skip build, 1: verbosity, 2: cache, 3: output, 4: manual watch, 5: debounce
+    // 0: skip build, 1: skip restore, 2: verbosity, 3: output,
+    // 4: manual watch, 5: debounce, 6: confirm exit on Esc
     let mut config_cursor: usize = 0;
+    let mut show_exit_confirm = false;
     let mut show_help = false;
     let mut show_output_fullscreen = false;
     let mut show_save_preset = false;
@@ -561,7 +563,6 @@ pub(super) fn run_interactive_loop(
                 };
                 let mw = if run_config.manual_watch_enabled { "on " } else { "off" };
                 let d = run_config.manual_watch_delay_ms;
-
                 let mut config_lines: Vec<Line> = vec![
                     Line::from(""),
                     Line::from(Span::styled(" Build & output ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
@@ -582,6 +583,10 @@ pub(super) fn run_interactive_loop(
                         if run_config.manual_watch_enabled { "[x]" } else { "[ ]" }
                     ),
                     format!("  [∙]  Watch debounce:  {d} ms   ←/→: ±200  (applies to manual watch)"),
+                    format!(
+                        "  {}  Confirm exit on Esc",
+                        if run_config.confirm_exit_on_esc { "[x]" } else { "[ ]" }
+                    ),
                 ];
                 for (i, line) in line_strings.iter().enumerate() {
                     let style = if i == config_cursor {
@@ -878,6 +883,28 @@ pub(super) fn run_interactive_loop(
                     f.render_widget(help_widget, help_popup);
                 }
             }
+
+            if show_exit_confirm {
+                let popup = centered_rect(52, 9, area);
+                f.render_widget(Clear, popup);
+                let confirm_lines = vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  Exit dotest?",
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                    Line::from("  Enter / Y : Yes, quit"),
+                    Line::from("  Esc / N   : No, stay"),
+                ];
+                let confirm_widget = Paragraph::new(confirm_lines).block(
+                    Block::default()
+                        .title(" Confirm Exit ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Yellow)),
+                );
+                f.render_widget(confirm_widget, popup);
+            }
         })?;
 
         if event::poll(std::time::Duration::from_millis(50))? {
@@ -1033,6 +1060,19 @@ pub(super) fn run_interactive_loop(
                         match key.code {
                             KeyCode::Esc | KeyCode::Enter => {
                                 show_help = false;
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    if show_exit_confirm {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                                show_exit_confirm = false;
+                            }
+                            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                break;
                             }
                             _ => {}
                         }
@@ -1364,7 +1404,7 @@ pub(super) fn run_interactive_loop(
                                 }
                             }
                             KeyCode::Down => {
-                                if config_cursor < 5 {
+                                if config_cursor < 6 {
                                     config_cursor += 1;
                                 }
                             }
@@ -1412,6 +1452,10 @@ pub(super) fn run_interactive_loop(
                                     );
                                 }
                                 5 => {}
+                                6 => {
+                                    run_config.confirm_exit_on_esc =
+                                        !run_config.confirm_exit_on_esc;
+                                }
                                 _ => {}
                             },
                             _ => {}
@@ -1663,7 +1707,11 @@ pub(super) fn run_interactive_loop(
                                 search_query.clear();
                                 state.select(Some(0));
                             } else {
-                                break;
+                                if run_config.confirm_exit_on_esc {
+                                    show_exit_confirm = true;
+                                } else {
+                                    break;
+                                }
                             }
                         }
 

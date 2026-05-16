@@ -1129,10 +1129,7 @@ pub fn build_test_command(filter: Option<String>, no_build: bool, no_restore: bo
     cmd
 }
 
-/// Returns the `/p:BaseOutputPath=...` MSBuild argument with an absolute path.
+/// Returns the `/p:BaseOutputPath=...` MSBuild argument with a relative path.
 fn get_base_output_path_arg() -> String {
-    let path = std::env::current_dir()
-        .unwrap_or_default()
-        .join("bin/dotest/");
-    format!("/p:BaseOutputPath={}", path.display())
+    "/p:BaseOutputPath=bin/dotest/".to_string()
 }

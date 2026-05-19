@@ -27,10 +27,13 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{
+        block::{Position, Title},
+        Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
+    },
     Terminal,
 };
 
@@ -44,6 +47,43 @@ use super::presets::{apply_preset_selection, collect_selected_tests, save_preset
 
 type DiscoveryEntries = Vec<(String, String, usize)>;
 type RediscoveryResult = std::result::Result<DiscoveryEntries, String>;
+
+const DEFAULT_TESTS_PANE_PERCENT: u16 = 22;
+const PANE_RESIZE_STEP_ROWS: u16 = 1;
+const MIN_TESTS_PANE_ROWS: u16 = 3;
+const MIN_OUTPUT_PANE_ROWS: u16 = 1;
+const STATUS_PANE_ROWS: u16 = 3;
+
+fn clamp_tests_pane_rows(rows: u16, terminal_height: u16) -> u16 {
+    let max_tests_rows =
+        terminal_height.saturating_sub(STATUS_PANE_ROWS + MIN_OUTPUT_PANE_ROWS);
+    let min_tests_rows = MIN_TESTS_PANE_ROWS.min(max_tests_rows);
+
+    rows.clamp(min_tests_rows, max_tests_rows)
+}
+
+fn default_tests_pane_rows(terminal_height: u16) -> u16 {
+    let resizable_height = terminal_height.saturating_sub(STATUS_PANE_ROWS);
+    let default_rows = resizable_height.saturating_mul(DEFAULT_TESTS_PANE_PERCENT) / 100;
+
+    clamp_tests_pane_rows(default_rows, terminal_height)
+}
+
+fn split_output_constraints(
+    tests_pane_rows: &mut Option<u16>,
+    terminal_height: u16,
+) -> Vec<Constraint> {
+    let rows = tests_pane_rows
+        .unwrap_or_else(|| default_tests_pane_rows(terminal_height));
+    let rows = clamp_tests_pane_rows(rows, terminal_height);
+    *tests_pane_rows = Some(rows);
+
+    vec![
+        Constraint::Length(rows),
+        Constraint::Min(MIN_OUTPUT_PANE_ROWS),
+        Constraint::Length(STATUS_PANE_ROWS),
+    ]
+}
 
 /// Interactive TUI: test tree, run output, settings, and failure summary.
 pub(super) fn run_interactive_loop(
@@ -68,6 +108,7 @@ pub(super) fn run_interactive_loop(
     let mut is_rediscovering = false;
     let mut output_scroll: u16 = 0;
     let mut output_follow_tail = true;
+    let mut tests_pane_rows: Option<u16> = run_config.tests_pane_rows;
     let mut run_pid: Option<u32> = None;
     let mut run_start: Option<Instant> = None;
     let mut rediscovery_start: Option<Instant> = None;
@@ -376,15 +417,18 @@ pub(super) fn run_interactive_loop(
         let show_output_panel =
             has_output && (run_config.output_mode == OutputMode::Split || show_output_fullscreen);
         let area = terminal.size()?;
+        let split_constraints = if show_output_panel && !show_output_fullscreen {
+            Some(split_output_constraints(&mut tests_pane_rows, area.height))
+        } else {
+            None
+        };
         let output_scroll_max = if show_output_panel {
             let constraints = if show_output_fullscreen {
-                vec![Constraint::Min(0), Constraint::Length(3)]
+                vec![Constraint::Min(0), Constraint::Length(STATUS_PANE_ROWS)]
             } else {
-                vec![
-                    Constraint::Percentage(22),
-                    Constraint::Percentage(75),
-                    Constraint::Length(3),
-                ]
+                split_constraints.clone().unwrap_or_else(|| {
+                    split_output_constraints(&mut tests_pane_rows, area.height)
+                })
             };
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
@@ -408,11 +452,21 @@ pub(super) fn run_interactive_loop(
             let area = f.size();
 
             let constraints = if show_output_fullscreen {
-                vec![Constraint::Min(0), Constraint::Length(3)]
+                vec![Constraint::Min(0), Constraint::Length(STATUS_PANE_ROWS)]
             } else if show_output_panel {
-                vec![Constraint::Percentage(22), Constraint::Percentage(75), Constraint::Length(3)]
+                split_constraints.clone().unwrap_or_else(|| {
+                    vec![
+                        Constraint::Length(default_tests_pane_rows(area.height)),
+                        Constraint::Min(MIN_OUTPUT_PANE_ROWS),
+                        Constraint::Length(STATUS_PANE_ROWS),
+                    ]
+                })
             } else {
-                vec![Constraint::Min(0), Constraint::Length(0), Constraint::Length(3)]
+                vec![
+                    Constraint::Min(0),
+                    Constraint::Length(0),
+                    Constraint::Length(STATUS_PANE_ROWS),
+                ]
             };
 
             let chunks = Layout::default()
@@ -449,8 +503,15 @@ pub(super) fn run_interactive_loop(
 
             if !show_output_fullscreen {
                 let title = format!(" Tests ({}/{}) ", selected_count, total_count);
-                let list = List::new(items)
-                    .block(Block::default().title(title).borders(Borders::ALL));
+                let mut block = Block::default().title(title).borders(Borders::ALL);
+                if show_output_panel {
+                    block = block.title(
+                        Title::from(" Ctrl+I/O ")
+                            .alignment(Alignment::Right)
+                            .position(Position::Bottom),
+                    );
+                }
+                let list = List::new(items).block(block);
                 f.render_stateful_widget(list, chunks[0], &mut state);
             }
 
@@ -628,6 +689,7 @@ pub(super) fn run_interactive_loop(
                     Line::from("  Esc       : Cancel a run in progress, or leave fullscreen output"),
                     Line::from("  PgUp/Dn, Home, End : Scroll the output pane (when visible)"),
                     Line::from("  Mouse wheel : Scroll output when the output panel is focused"),
+                    Line::from("  Ctrl+I/O : Move the Tests/Output split up/down one row"),
                     Line::from("  Output title shows [follow] (tail) vs [scroll] (manual)"),
                     Line::from(""),
                     Line::from(Span::styled(" Toggles & shortcuts", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
@@ -1463,6 +1525,34 @@ pub(super) fn run_interactive_loop(
                         continue;
                     }
 
+                    if show_output_panel && !show_output_fullscreen {
+                        let resize_delta = match key.code {
+                            KeyCode::Char('i' | 'I')
+                                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                Some(-(PANE_RESIZE_STEP_ROWS as i16))
+                            }
+                            KeyCode::Char('o' | 'O')
+                                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                Some(PANE_RESIZE_STEP_ROWS as i16)
+                            }
+                            _ => None,
+                        };
+
+                        if let Some(delta) = resize_delta {
+                            let current = tests_pane_rows
+                                .unwrap_or_else(|| default_tests_pane_rows(area.height));
+                            let next = if delta.is_negative() {
+                                current.saturating_sub(delta.unsigned_abs())
+                            } else {
+                                current.saturating_add(delta as u16)
+                            };
+                            tests_pane_rows = Some(clamp_tests_pane_rows(next, area.height));
+                            continue;
+                        }
+                    }
+
                     if is_running {
                         match key.code {
                             KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1829,6 +1919,10 @@ pub(super) fn run_interactive_loop(
 
     if let Some(h) = manual_watch_handle {
         h.stop();
+    }
+    if run_config.tests_pane_rows != tests_pane_rows {
+        run_config.tests_pane_rows = tests_pane_rows;
+        run_config.save();
     }
     super::discovery_cache::save_tree_state(TreeState::capture(tree));
     disable_raw_mode()?;

@@ -51,6 +51,9 @@ pub(crate) struct RunConfig {
     cache_tests: bool,
     #[serde(default = "default_output_mode")]
     pub output_mode: OutputMode,
+    /// Remembered height of the Tests pane when Output is shown in split mode.
+    #[serde(default)]
+    pub tests_pane_rows: Option<u16>,
     /// When set, a background watcher re-runs **only the tests you have checked in the tree**
     /// when `.cs` files change (debounced). For this option, you choose the scope.
     /// In the future, maybe add an automatic scope based on impact analysis.
@@ -74,6 +77,7 @@ impl Default for RunConfig {
             verbosity: Verbosity::Normal,
             cache_tests: false,
             output_mode: OutputMode::Split,
+            tests_pane_rows: None,
             manual_watch_enabled: false,
             manual_watch_delay_ms: 2000,
             confirm_exit_on_esc: true,

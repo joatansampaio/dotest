@@ -54,6 +54,9 @@ pub(crate) struct RunConfig {
     /// Remembered height of the Tests pane when Output is shown in split mode.
     #[serde(default)]
     pub tests_pane_rows: Option<u16>,
+    /// Remembered width of the Failed Tests list pane in the failure summary overlay.
+    #[serde(default)]
+    pub failed_summary_list_pane_cols: Option<u16>,
     /// When set, a background watcher re-runs **only the tests you have checked in the tree**
     /// when `.cs` files change (debounced). For this option, you choose the scope.
     /// In the future, maybe add an automatic scope based on impact analysis.
@@ -78,6 +81,7 @@ impl Default for RunConfig {
             cache_tests: false,
             output_mode: OutputMode::Split,
             tests_pane_rows: None,
+            failed_summary_list_pane_cols: None,
             manual_watch_enabled: false,
             manual_watch_delay_ms: 2000,
             confirm_exit_on_esc: true,

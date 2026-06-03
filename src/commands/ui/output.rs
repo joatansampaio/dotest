@@ -1,6 +1,6 @@
 use crate::core::executor::build_test_command;
 use anyhow::Result;
-use std::io::{self, BufRead};
+use std::io::Read;
 use std::process::Stdio;
 use std::sync::mpsc;
 use std::thread;
@@ -57,26 +57,67 @@ pub(super) fn spawn_test_run(
     let tx2 = tx.clone();
     let tx3 = tx.clone();
 
-    thread::spawn(move || {
-        for line in io::BufReader::new(stdout).lines().flatten() {
-            if tx.send(OutputEvent::Line(line)).is_err() {
-                break;
-            }
-        }
-    });
-    thread::spawn(move || {
-        for line in io::BufReader::new(stderr).lines().flatten() {
-            if tx2.send(OutputEvent::Line(line)).is_err() {
-                break;
-            }
-        }
-    });
+    thread::spawn(move || pump_stream_lines(stdout, tx));
+    thread::spawn(move || pump_stream_lines(stderr, tx2));
     thread::spawn(move || {
         let code = child.wait().ok().and_then(|s| s.code());
         let _ = tx3.send(OutputEvent::Finished(code));
     });
 
     Ok((rx, pid))
+}
+
+// Reads a process stream as raw bytes and emits UI lines on both '\n' and '\r'.
+// We use this instead of `BufRead::lines()` because test runner/logging output
+// can contain carriage-return updates and partial chunks that are not reliably
+// surfaced with the previous technique of using .lines().flatten().
+fn pump_stream_lines<R: Read>(mut stream: R, tx: mpsc::Sender<OutputEvent>) {
+    const READ_BUF_SIZE: usize = 4096;
+    let mut buf = [0_u8; READ_BUF_SIZE];
+    let mut pending: Vec<u8> = Vec::new();
+    let mut prev_was_cr = false;
+    let emit_pending = |pending: &mut Vec<u8>, tx: &mpsc::Sender<OutputEvent>| {
+        let line = String::from_utf8_lossy(pending).into_owned();
+        pending.clear();
+        tx.send(OutputEvent::Line(line)).is_ok()
+    };
+
+    loop {
+        let read = match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+
+        for &byte in &buf[..read] {
+            match byte {
+                b'\r' => {
+                    if !emit_pending(&mut pending, &tx) {
+                        return;
+                    }
+                    prev_was_cr = true;
+                }
+                b'\n' => {
+                    if prev_was_cr {
+                        prev_was_cr = false;
+                        continue;
+                    }
+
+                    if !emit_pending(&mut pending, &tx) {
+                        return;
+                    }
+                }
+                _ => {
+                    pending.push(byte);
+                    prev_was_cr = false;
+                }
+            }
+        }
+    }
+
+    if !pending.is_empty() {
+        let _ = emit_pending(&mut pending, &tx);
+    }
 }
 
 pub(super) fn kill_process(pid: u32) {

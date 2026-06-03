@@ -4,7 +4,7 @@ use anyhow::Result;
 use arboard::Clipboard;
 use std::io;
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::failed_tests::{
     build_filter_for_display_names, extract_failed_tests, filter_key_for_vstest, FailedTestInfo,
@@ -42,7 +42,7 @@ use super::filter::build_filter;
 use super::layout::{
     centered_rect, format_elapsed, output_wrapped_scroll_max, styled_output_lines,
 };
-use super::output::{kill_process, OutputEvent};
+use super::output::{kill_process, spawn_test_run, OutputEvent};
 use super::presets::{apply_preset_selection, collect_selected_tests, save_preset};
 
 type DiscoveryEntries = Vec<(String, String, usize)>;
@@ -53,6 +53,27 @@ const PANE_RESIZE_STEP_ROWS: u16 = 1;
 const MIN_TESTS_PANE_ROWS: u16 = 3;
 const MIN_OUTPUT_PANE_ROWS: u16 = 1;
 const STATUS_PANE_ROWS: u16 = 3;
+const QUICK_CHURN_LIMIT: usize = 100;
+
+fn churn_duration_stats_line(durations: &[Duration]) -> Option<String> {
+    if durations.is_empty() {
+        return None;
+    }
+
+    let min = durations.iter().min().copied().unwrap_or_default();
+    let max = durations.iter().max().copied().unwrap_or_default();
+    let total_nanos: u128 = durations.iter().map(|d| d.as_nanos()).sum();
+    let avg_nanos = total_nanos / durations.len() as u128;
+    let avg_nanos_u64 = avg_nanos.min(u64::MAX as u128) as u64;
+    let avg = Duration::from_nanos(avg_nanos_u64);
+
+    Some(format!(
+        "  Duration stats: avg {}  |  min {}  |  max {}",
+        format_elapsed(avg),
+        format_elapsed(min),
+        format_elapsed(max)
+    ))
+}
 
 fn clamp_tests_pane_rows(rows: u16, terminal_height: u16) -> u16 {
     let max_tests_rows =
@@ -115,6 +136,12 @@ pub(super) fn run_interactive_loop(
     let mut run_passed = 0;
     let mut run_failed = 0;
     let mut run_skipped = 0;
+    let mut is_churning = false;
+    let mut churn_iteration: usize = 0;
+    let mut churn_limit: Option<usize> = None;
+    let mut churn_filter: Option<String> = None;
+    let mut churn_successes_before_failure: usize = 0;
+    let mut churn_durations: Vec<Duration> = Vec::new();
     let mut failed_tests: Vec<FailedTestInfo> = Vec::new();
     let mut show_failure_summary = false;
     let mut show_failure_summary_help = false;
@@ -142,9 +169,14 @@ pub(super) fn run_interactive_loop(
     apply_manual_watch_config(&root_dir, &run_config, &mut manual_watch_handle);
 
     loop {
-        if let Some(ref rx) = output_rx {
+        if output_rx.is_some() {
             loop {
-                match rx.try_recv() {
+                let recv_result = match output_rx.as_ref() {
+                    Some(rx) => rx.try_recv(),
+                    None => break,
+                };
+
+                match recv_result {
                     Ok(OutputEvent::Line(line)) => {
                         let trimmed = line.trim();
 
@@ -192,48 +224,193 @@ pub(super) fn run_interactive_loop(
                         }
                     }
                     Ok(OutputEvent::Finished(code)) => {
-                        is_running = false;
-                        let elapsed = run_start
-                            .map(|s| format_elapsed(s.elapsed()))
-                            .unwrap_or_default();
+                        if is_churning {
+                            let elapsed_duration = run_start.map(|s| s.elapsed());
+                            let elapsed = elapsed_duration
+                                .map(format_elapsed)
+                                .unwrap_or_default();
 
-                        output_lines.push(String::new());
-                        output_lines.push(
-                            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                                .to_string(),
-                        );
+                            if let Some(d) = elapsed_duration {
+                                churn_durations.push(d);
+                            }
 
-                        let total = run_passed + run_failed + run_skipped;
-                        let mut summary = format!("  Test Run Summary ({} total)", total);
-                        if run_passed > 0 {
-                            summary.push_str(&format!("  |  ✓ {} Passed", run_passed));
-                        }
-                        if run_failed > 0 {
-                            summary.push_str(&format!("  |  ✗ {} Failed", run_failed));
-                        }
-                        if run_skipped > 0 {
-                            summary.push_str(&format!("  |  ⚠ {} Skipped", run_skipped));
-                        }
-                        output_lines.push(summary);
+                            if code == Some(0) {
+                                churn_successes_before_failure += 1;
+                                output_lines.push(format!(
+                                    "Iteration {}   ✓ Passed ({})",
+                                    churn_iteration, elapsed
+                                ));
 
-                        let msg = match code {
-                            Some(0) => format!("  Finished successfully in {}", elapsed),
-                            Some(c) => format!("  Finished with exit code {} in {}", c, elapsed),
-                            None => format!("  Process terminated after {}", elapsed),
-                        };
-                        output_lines.push(msg);
-                        output_lines.push(
-                            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                                .to_string(),
-                        );
-                        failed_tests = extract_failed_tests(&output_lines);
-                        if run_failed > 0 && !failed_tests.is_empty() {
-                            show_failure_summary = true;
-                            failed_selection = 0;
-                            failed_detail_scroll = 0;
-                            failure_detail_hover = None;
+                                let reached_limit = churn_limit
+                                    .map(|limit| churn_successes_before_failure >= limit)
+                                    .unwrap_or(false);
+
+                                if reached_limit {
+                                    is_running = false;
+                                    is_churning = false;
+                                    run_pid = None;
+                                    output_rx = None;
+
+                                    output_lines.push(String::new());
+                                    output_lines.push(
+                                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                                            .to_string(),
+                                    );
+                                    output_lines.push(format!(
+                                        "  Churn completed: reached iteration limit {} with no failures.",
+                                        churn_limit.unwrap_or_default()
+                                    ));
+                                    output_lines.push(format!(
+                                        "  Successful iterations: {}",
+                                        churn_successes_before_failure
+                                    ));
+                                    if let Some(stats) = churn_duration_stats_line(&churn_durations)
+                                    {
+                                        output_lines.push(stats);
+                                    }
+                                    output_lines.push(
+                                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                                            .to_string(),
+                                    );
+
+                                    churn_filter = None;
+                                    churn_limit = None;
+                                } else if let Some(filter) = churn_filter.clone() {
+                                    churn_iteration += 1;
+                                    run_passed = 0;
+                                    run_failed = 0;
+                                    run_skipped = 0;
+                                    output_lines
+                                        .push(format!("Iteration {}   ↻ Starting", churn_iteration));
+
+                                    let mut churn_run_config = run_config.clone();
+                                    churn_run_config.no_build = true;
+                                    churn_run_config.no_restore = true;
+
+                                    match spawn_test_run(Some(filter), &churn_run_config) {
+                                        Ok((rx, pid)) => {
+                                            output_rx = Some(rx);
+                                            run_pid = Some(pid);
+                                            run_start = Some(Instant::now());
+                                            is_running = true;
+                                        }
+                                        Err(e) => {
+                                            is_running = false;
+                                            is_churning = false;
+                                            run_pid = None;
+                                            output_rx = None;
+                                            output_lines.push(format!(
+                                                "✗ Could not start churn iteration {}: {}",
+                                                churn_iteration, e
+                                            ));
+                                            churn_filter = None;
+                                            churn_limit = None;
+                                        }
+                                    }
+                                } else {
+                                    is_running = false;
+                                    is_churning = false;
+                                    run_pid = None;
+                                    output_rx = None;
+                                    output_lines.push(
+                                        "✗ Churn stopped: missing test filter for next iteration."
+                                            .to_string(),
+                                    );
+                                    churn_limit = None;
+                                }
+                            } else {
+                                is_running = false;
+                                is_churning = false;
+                                run_pid = None;
+
+                                output_lines.push(format!(
+                                    "Iteration {}   ✗ Failed ({})",
+                                    churn_iteration, elapsed
+                                ));
+                                output_lines.push(String::new());
+                                output_lines.push(
+                                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                                        .to_string(),
+                                );
+                                output_lines.push(format!(
+                                    "  Churn stopped on failure at iteration {}.",
+                                    churn_iteration
+                                ));
+                                output_lines.push(format!(
+                                    "  Successful iterations before failure: {}",
+                                    churn_successes_before_failure
+                                ));
+                                if let Some(stats) = churn_duration_stats_line(&churn_durations) {
+                                    output_lines.push(stats);
+                                }
+
+                                let msg = match code {
+                                    Some(c) => format!("  Last run exit code: {}", c),
+                                    None => "  Last run terminated without an exit code".to_string(),
+                                };
+                                output_lines.push(msg);
+                                output_lines.push(
+                                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                                        .to_string(),
+                                );
+
+                                failed_tests = extract_failed_tests(&output_lines);
+                                if !failed_tests.is_empty() {
+                                    show_failure_summary = true;
+                                    failed_selection = 0;
+                                    failed_detail_scroll = 0;
+                                    failure_detail_hover = None;
+                                }
+
+                                churn_filter = None;
+                                churn_limit = None;
+                            }
+                        } else {
+                            is_running = false;
+                            let elapsed = run_start
+                                .map(|s| format_elapsed(s.elapsed()))
+                                .unwrap_or_default();
+
+                            output_lines.push(String::new());
+                            output_lines.push(
+                                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                                    .to_string(),
+                            );
+
+                            let total = run_passed + run_failed + run_skipped;
+                            let mut summary = format!("  Test Run Summary ({} total)", total);
+                            if run_passed > 0 {
+                                summary.push_str(&format!("  |  ✓ {} Passed", run_passed));
+                            }
+                            if run_failed > 0 {
+                                summary.push_str(&format!("  |  ✗ {} Failed", run_failed));
+                            }
+                            if run_skipped > 0 {
+                                summary.push_str(&format!("  |  ⚠ {} Skipped", run_skipped));
+                            }
+                            output_lines.push(summary);
+
+                            let msg = match code {
+                                Some(0) => format!("  Finished successfully in {}", elapsed),
+                                Some(c) => {
+                                    format!("  Finished with exit code {} in {}", c, elapsed)
+                                }
+                                None => format!("  Process terminated after {}", elapsed),
+                            };
+                            output_lines.push(msg);
+                            output_lines.push(
+                                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                                    .to_string(),
+                            );
+                            failed_tests = extract_failed_tests(&output_lines);
+                            if run_failed > 0 && !failed_tests.is_empty() {
+                                show_failure_summary = true;
+                                failed_selection = 0;
+                                failed_detail_scroll = 0;
+                                failure_detail_hover = None;
+                            }
+                            run_pid = None;
                         }
-                        run_pid = None;
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
@@ -523,6 +700,22 @@ pub(super) fn run_interactive_loop(
                         .map(|s| format_elapsed(s.elapsed()))
                         .unwrap_or_default();
                     format!(" Output (Rediscovering... {}) [follow] ", elapsed)
+                } else if is_running && is_churning {
+                    let elapsed = run_start.map(|s| format_elapsed(s.elapsed())).unwrap_or_default();
+                    let limit_suffix = churn_limit
+                        .map(|limit| format!("/{}", limit))
+                        .unwrap_or_default();
+                    if output_follow_tail {
+                        format!(
+                            " Output (Churning {}{}... {}) [follow]  |  ✓:{}  ✗:{}  ⚠:{} ",
+                            churn_iteration, limit_suffix, elapsed, run_passed, run_failed, run_skipped
+                        )
+                    } else {
+                        format!(
+                            " Output (Churning {}{}... {}) [scroll]  |  ✓:{}  ✗:{}  ⚠:{} ",
+                            churn_iteration, limit_suffix, elapsed, run_passed, run_failed, run_skipped
+                        )
+                    }
                 } else if is_running {
                     let elapsed = run_start.map(|s| format_elapsed(s.elapsed())).unwrap_or_default();
                     if output_follow_tail {
@@ -575,6 +768,15 @@ pub(super) fn run_interactive_loop(
                     " Search: {}  |  Esc: clear  Enter: run  ?: help{}",
                     search_query, watch_hint
                 )
+            } else if is_running && is_churning {
+                let elapsed = run_start.map(|s| format_elapsed(s.elapsed())).unwrap_or_default();
+                let limit_suffix = churn_limit
+                    .map(|limit| format!("/{}", limit))
+                    .unwrap_or_else(|| "/∞".to_string());
+                format!(
+                    " Churning iteration {}{}... {}  |  Ctrl+E: failed summary  Esc: stop churn{}",
+                    churn_iteration, limit_suffix, elapsed, watch_hint
+                )
             } else if is_running {
                 let elapsed = run_start.map(|s| format_elapsed(s.elapsed())).unwrap_or_default();
                 format!(
@@ -590,7 +792,7 @@ pub(super) fn run_interactive_loop(
                     elapsed, watch_hint
                 )
             } else {
-                let mut text = " Arrows: nav  Space: toggle  Enter: run  PgUp/PgDn/Home/End: output scroll ".to_string();
+                let mut text = " Arrows: nav  Space: toggle  Enter: run  Ctrl+U: churn  Ctrl+Shift+U: churn 100x  PgUp/PgDn/Home/End: output scroll ".to_string();
                 if run_config.manual_watch_enabled {
                     text.push_str(watch_hint);
                 }
@@ -686,6 +888,8 @@ pub(super) fn run_interactive_loop(
                     Line::from(""),
                     Line::from(Span::styled(" Running & output", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
                     Line::from("  Enter     : Run all checked tests"),
+                    Line::from("  Ctrl+U    : Churn checked tests until failure (or until manually stopped)"),
+                    Line::from("  Ctrl+Shift+U : Quick churn with max 100 iterations"),
                     Line::from("  Esc       : Cancel a run in progress, or leave fullscreen output"),
                     Line::from("  PgUp/Dn, Home, End : Scroll the output pane (when visible)"),
                     Line::from("  Mouse wheel : Scroll output when the output panel is focused"),
@@ -1599,7 +1803,25 @@ pub(super) fn run_interactive_loop(
                                     .map(|s| format_elapsed(s.elapsed()))
                                     .unwrap_or_default();
                                 output_lines.push(String::new());
-                                output_lines.push(format!("⚠ Cancelled ({})", elapsed));
+                                if is_churning {
+                                    output_lines.push(format!(
+                                        "⚠ Churn stopped by user at iteration {} ({})",
+                                        churn_iteration, elapsed
+                                    ));
+                                    output_lines.push(format!(
+                                        "  Successful iterations before stop: {}",
+                                        churn_successes_before_failure
+                                    ));
+                                    if let Some(stats) = churn_duration_stats_line(&churn_durations)
+                                    {
+                                        output_lines.push(stats);
+                                    }
+                                } else {
+                                    output_lines.push(format!("⚠ Cancelled ({})", elapsed));
+                                }
+                                is_churning = false;
+                                churn_filter = None;
+                                churn_limit = None;
                                 output_rx = None;
                             }
                             _ => {}
@@ -1650,6 +1872,86 @@ pub(super) fn run_interactive_loop(
                         for node in tree.iter_mut() {
                             node.is_selected = to_state;
                             node.is_partial = false;
+                        }
+                        continue;
+                    }
+
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && matches!(key.code, KeyCode::Char('u' | 'U'))
+                    {
+                        let filter = build_filter(tree);
+                        if let Some(filter_str) = filter {
+                            let quick_limit = key.modifiers.contains(KeyModifiers::SHIFT)
+                                || matches!(key.code, KeyCode::Char('U'));
+                            let limit = if quick_limit {
+                                Some(QUICK_CHURN_LIMIT)
+                            } else {
+                                None
+                            };
+
+                            let sel_count: usize = tree
+                                .iter()
+                                .filter(|n| n.is_leaf && n.is_selected)
+                                .map(|n| n.test_count)
+                                .sum();
+
+                            output_lines.clear();
+                            output_scroll = 0;
+                            output_follow_tail = true;
+                            failed_tests.clear();
+                            show_failure_summary = false;
+                            failed_selection = 0;
+                            failed_detail_scroll = 0;
+                            failure_detail_hover = None;
+
+                            is_churning = true;
+                            churn_iteration = 1;
+                            churn_limit = limit;
+                            churn_filter = Some(filter_str.clone());
+                            churn_successes_before_failure = 0;
+                            churn_durations.clear();
+
+                            let heading = format!(
+                                "━━━ Churning {sel_count} selected test(s) until failure… ━━━"
+                            );
+                            output_lines.push(heading);
+                            if let Some(limit) = churn_limit {
+                                output_lines.push(format!(
+                                    "  Iteration limit: {} (quick churn mode)",
+                                    limit
+                                ));
+                            }
+                            output_lines.push("Iteration 1   ↻ Starting".to_string());
+                            output_lines.push(String::new());
+
+                            let mut first_churn_run_config = run_config.clone();
+                            first_churn_run_config.no_build = false;
+                            first_churn_run_config.no_restore = true;
+
+                            match spawn_test_run(Some(filter_str), &first_churn_run_config) {
+                                Ok((rx, pid)) => {
+                                    output_rx = Some(rx);
+                                    run_pid = Some(pid);
+                                    run_start = Some(Instant::now());
+                                    run_passed = 0;
+                                    run_failed = 0;
+                                    run_skipped = 0;
+                                    is_running = true;
+                                    show_output_fullscreen =
+                                        run_config.output_mode == OutputMode::Fullscreen;
+                                }
+                                Err(e) => {
+                                    is_churning = false;
+                                    churn_filter = None;
+                                    churn_limit = None;
+                                    output_lines.push(format!("Error: {e}"));
+                                }
+                            }
+                        } else {
+                            output_lines.push(
+                                "⚠ Select at least one test before starting churn (Ctrl+U)."
+                                    .to_string(),
+                            );
                         }
                         continue;
                     }

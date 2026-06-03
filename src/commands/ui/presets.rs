@@ -91,6 +91,7 @@ mod tests {
             label: name.to_string(),
             fqn: Some(name.to_string()),
             is_selected: selected,
+            is_partial: false,
             is_expanded: true,
             depth: 0,
             parent_idx: None,

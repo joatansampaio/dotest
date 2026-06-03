@@ -11,7 +11,24 @@ use ratatui::{
 };
 
 use super::failed_tests::FailedTestInfo;
-use super::layout::centered_rect;
+
+const DEFAULT_FAILED_SUMMARY_LIST_PANE_COLS: u16 = 32;
+const MIN_FAILED_SUMMARY_LIST_PANE_COLS: u16 = 16;
+const MIN_FAILED_SUMMARY_DETAIL_PANE_COLS: u16 = 20;
+
+pub(crate) fn clamp_failed_summary_list_pane_cols(cols: u16, area_width: u16) -> u16 {
+    let max_cols = area_width.saturating_sub(MIN_FAILED_SUMMARY_DETAIL_PANE_COLS);
+    let min_cols = MIN_FAILED_SUMMARY_LIST_PANE_COLS.min(max_cols);
+    cols.clamp(min_cols, max_cols)
+}
+
+pub(crate) fn compute_failure_summary_list_pane_cols(
+    saved_cols: Option<u16>,
+    area_width: u16,
+) -> u16 {
+    let cols = saved_cols.unwrap_or(DEFAULT_FAILED_SUMMARY_LIST_PANE_COLS);
+    clamp_failed_summary_list_pane_cols(cols, area_width)
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct StackTraceTarget {
@@ -123,25 +140,25 @@ pub(crate) fn open_path_in_default_editor(path: &str) -> io::Result<()> {
     ))
 }
 
-fn failed_summary_popup_layout(area: Rect) -> (Rect, Rect) {
-    let popup = centered_rect(88, 76, area);
+fn failed_summary_popup_layout(area: Rect, list_pane_cols: u16) -> (Rect, Rect) {
+    let popup = area;
     let inner = Layout::default()
         .direction(Direction::Vertical)
         .constraints(vec![Constraint::Min(0), Constraint::Length(2)])
         .split(popup);
     let body = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints(vec![Constraint::Percentage(40), Constraint::Percentage(60)])
+        .constraints(vec![Constraint::Length(list_pane_cols), Constraint::Min(0)])
         .split(inner[0]);
     (body[0], body[1])
 }
 
-pub(crate) fn failed_summary_list_rect(area: Rect) -> Rect {
-    failed_summary_popup_layout(area).0
+pub(crate) fn failed_summary_list_rect(area: Rect, list_pane_cols: u16) -> Rect {
+    failed_summary_popup_layout(area, list_pane_cols).0
 }
 
-pub(crate) fn failed_summary_detail_rect(area: Rect) -> Rect {
-    failed_summary_popup_layout(area).1
+pub(crate) fn failed_summary_detail_rect(area: Rect, list_pane_cols: u16) -> Rect {
+    failed_summary_popup_layout(area, list_pane_cols).1
 }
 
 /// Styling for one error-detail line. Use the same function for `Paragraph` rendering and for

@@ -10,9 +10,10 @@ use super::failed_tests::{
     build_filter_for_display_names, extract_failed_tests, filter_key_for_vstest, FailedTestInfo,
 };
 use super::failure_summary::{
-    clicked_detail_index, compute_failure_detail_link_hover, failed_detail_styled_line_with_hover,
-    failed_summary_detail_rect, failed_summary_list_rect, open_path_in_default_editor,
-    parse_stack_trace_target,
+    clamp_failed_summary_list_pane_cols, clicked_detail_index,
+    compute_failure_summary_list_pane_cols, compute_failure_detail_link_hover,
+    failed_detail_styled_line_with_hover, failed_summary_detail_rect, failed_summary_list_rect,
+    open_path_in_default_editor, parse_stack_trace_target,
 };
 use super::manual_watch::{apply_manual_watch_config, ManualWatchHandle};
 use super::test_run::launch_filtered_test_run;
@@ -147,6 +148,8 @@ pub(super) fn run_interactive_loop(
     let mut show_failure_summary_help = false;
     let mut failed_selection: usize = 0;
     let mut failed_detail_scroll: u16 = 0;
+    let mut failed_summary_list_pane_cols: Option<u16> =
+        run_config.failed_summary_list_pane_cols;
     // Detail line index for stack links while the pointer is over that line in Error Details.
     let mut failure_detail_hover: Option<usize> = None;
 
@@ -1004,7 +1007,7 @@ pub(super) fn run_interactive_loop(
             }
 
             if show_failure_summary {
-                let popup = centered_rect(88, 76, area);
+                let popup = area;
                 f.render_widget(Clear, popup);
                 f.render_widget(
                     Block::default()
@@ -1021,7 +1024,13 @@ pub(super) fn run_interactive_loop(
 
                 let body = Layout::default()
                     .direction(Direction::Horizontal)
-                    .constraints(vec![Constraint::Percentage(40), Constraint::Percentage(60)])
+                    .constraints(vec![
+                        Constraint::Length(compute_failure_summary_list_pane_cols(
+                            failed_summary_list_pane_cols,
+                            popup.width,
+                        )),
+                        Constraint::Min(0),
+                    ])
                     .split(inner[0]);
 
                 let mut failed_items: Vec<ListItem> = Vec::new();
@@ -1052,6 +1061,11 @@ pub(super) fn run_interactive_loop(
                 let failed_list = List::new(failed_items).block(
                     Block::default()
                         .title(" Failed Tests ")
+                        .title(
+                            Title::from(" Ctrl+I/O ")
+                                .alignment(Alignment::Right)
+                                .position(Position::Bottom),
+                        )
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(Color::Red)),
                 );
@@ -1178,7 +1192,11 @@ pub(super) fn run_interactive_loop(
                 Event::Mouse(mouse) => {
                     if show_failure_summary {
                         let area = terminal.size()?;
-                        let list_rect = failed_summary_list_rect(area);
+                        let failed_summary_list_cols = compute_failure_summary_list_pane_cols(
+                            failed_summary_list_pane_cols,
+                            area.width,
+                        );
+                        let list_rect = failed_summary_list_rect(area, failed_summary_list_cols);
                         let list_inner_x = list_rect.x.saturating_add(1);
                         let list_inner_y = list_rect.y.saturating_add(1);
                         let list_inner_width = list_rect.width.saturating_sub(2);
@@ -1189,7 +1207,8 @@ pub(super) fn run_interactive_loop(
                             && mouse.column < list_inner_x.saturating_add(list_inner_width)
                             && mouse.row >= list_inner_y
                             && mouse.row < list_inner_y.saturating_add(list_inner_height);
-                        let detail_rect = failed_summary_detail_rect(area);
+                        let detail_rect =
+                            failed_summary_detail_rect(area, failed_summary_list_cols);
                         let detail_inner_x = detail_rect.x.saturating_add(1);
                         let detail_inner_y = detail_rect.y.saturating_add(1);
                         let detail_inner_width = detail_rect.width.saturating_sub(2);
@@ -1478,6 +1497,35 @@ pub(super) fn run_interactive_loop(
                         }
 
                         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                        let resize_delta = match key.code {
+                            KeyCode::Char('i' | 'I')
+                                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                Some(-(PANE_RESIZE_STEP_ROWS as i16))
+                            }
+                            KeyCode::Char('o' | 'O')
+                                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                Some(PANE_RESIZE_STEP_ROWS as i16)
+                            }
+                            _ => None,
+                        };
+                        if let Some(delta) = resize_delta {
+                            let current = compute_failure_summary_list_pane_cols(
+                                failed_summary_list_pane_cols,
+                                area.width,
+                            );
+                            let next = if delta.is_negative() {
+                                current.saturating_sub(delta.unsigned_abs())
+                            } else {
+                                current.saturating_add(delta as u16)
+                            };
+                            failed_summary_list_pane_cols = Some(
+                                clamp_failed_summary_list_pane_cols(next, area.width),
+                            );
+                            continue;
+                        }
+
                         match key.code {
                             KeyCode::Esc => {
                                 show_failure_summary = false;
@@ -2222,8 +2270,16 @@ pub(super) fn run_interactive_loop(
     if let Some(h) = manual_watch_handle {
         h.stop();
     }
+    let mut should_save_config = false;
     if run_config.tests_pane_rows != tests_pane_rows {
         run_config.tests_pane_rows = tests_pane_rows;
+        should_save_config = true;
+    }
+    if run_config.failed_summary_list_pane_cols != failed_summary_list_pane_cols {
+        run_config.failed_summary_list_pane_cols = failed_summary_list_pane_cols;
+        should_save_config = true;
+    }
+    if should_save_config {
         run_config.save();
     }
     super::discovery_cache::save_tree_state(TreeState::capture(tree));

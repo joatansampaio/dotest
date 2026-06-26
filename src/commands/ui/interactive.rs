@@ -538,7 +538,12 @@ pub(super) fn run_interactive_loop(
             matches_query.fill(true);
         } else {
             for i in (0..tree.len()).rev() {
-                if tree[i].label.to_lowercase().contains(&query) {
+                let mut matched = tree[i].label.to_lowercase().contains(&query) || match_abbrev(&search_query, &tree[i].label);
+                if !matched && tree[i].fqn.is_some() {
+                    let fqn = tree[i].fqn.as_ref().unwrap();
+                    matched = fqn.to_lowercase().contains(&query) || match_abbrev(&search_query, fqn);
+                }
+                if matched {
                     matches_query[i] = true;
                     let mut curr = tree[i].parent_idx;
                     while let Some(p) = curr {
@@ -2291,4 +2296,72 @@ pub(super) fn run_interactive_loop(
     )?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+fn is_word_boundary(c: char, prev: Option<char>) -> bool {
+    let Some(p) = prev else { return true };
+    if c.is_uppercase() && !p.is_uppercase() { return true; }
+    if c.is_numeric() && !p.is_numeric() { return true; }
+    if p == '_' || p == '.' || !p.is_alphanumeric() { return true; }
+    false
+}
+
+fn match_abbrev(query: &str, target: &str) -> bool {
+    if query.is_empty() { return true; }
+    let q_chars: Vec<char> = query.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let t_chars: Vec<char> = target.chars().collect();
+    
+    let mut boundaries = Vec::new();
+    let mut prev = None;
+    for (i, &c) in t_chars.iter().enumerate() {
+        if is_word_boundary(c, prev) {
+            boundaries.push(i);
+        }
+        prev = Some(c);
+    }
+    
+    fn dfs(q_idx: usize, b_idx: usize, q_chars: &[char], t_chars: &[char], boundaries: &[usize]) -> bool {
+        if q_idx == q_chars.len() {
+            return true;
+        }
+        if b_idx == boundaries.len() {
+            return false;
+        }
+        
+        let start = boundaries[b_idx];
+        let mut matched = 0;
+        while q_idx + matched < q_chars.len() && start + matched < t_chars.len() {
+            if q_chars[q_idx + matched] == t_chars[start + matched].to_ascii_lowercase() {
+                matched += 1;
+                if dfs(q_idx + matched, b_idx + 1, q_chars, t_chars, boundaries) {
+                    return true;
+                }
+            } else {
+                break;
+            }
+        }
+        
+        dfs(q_idx, b_idx + 1, q_chars, t_chars, boundaries)
+    }
+    
+    dfs(0, 0, &q_chars, &t_chars, &boundaries)
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    #[test]
+    fn test_match_abbrev() {
+        let target = "MoveUnfinalizedRowsToNewBatch_MovesAllRowsForPartiallyProcessedRollup";
+        assert!(match_abbrev("MoveunfiRollup", target));
+        assert!(match_abbrev("MUR", target));
+        assert!(match_abbrev("muro", target));
+        assert!(!match_abbrev("MoveunfiRollupZ", target));
+        
+        let target2 = "Namespace.Class.Method";
+        assert!(match_abbrev("NCM", target2));
+        assert!(match_abbrev("NaClMe", target2));
+        assert!(!match_abbrev("NaClMex", target2));
+    }
 }

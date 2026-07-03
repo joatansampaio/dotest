@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive_ext: tar.gz
+            bin_name: dotest
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive_ext: tar.gz
+            bin_name: dotest
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive_ext: zip
+            bin_name: dotest.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package archive (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          ASSET_NAME="dotest-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir "$ASSET_NAME"
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" "$ASSET_NAME/"
+          cp README.md LICENSE "$ASSET_NAME/"
+          tar -czf "$ASSET_NAME.tar.gz" "$ASSET_NAME"
+          echo "ASSET_PATH=$ASSET_NAME.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $assetName = "dotest-${{ github.ref_name }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $assetName | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" "$assetName/"
+          Copy-Item README.md "$assetName/"
+          Copy-Item LICENSE "$assetName/"
+          Compress-Archive -Path "$assetName/*" -DestinationPath "$assetName.zip"
+          "ASSET_PATH=$assetName.zip" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ASSET_PATH }}
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release-assets/**/*.tar.gz
+            release-assets/**/*.zip

@@ -6,6 +6,30 @@ Instead of wading through verbose `dotnet test` console outputs and manually wri
 
 ## Installation / Building from Source
 
+### Install from GitHub Releases (Recommended)
+
+1. Open the Releases page:
+   ```bash
+   https://github.com/joatansampaio/dotest/releases
+   ```
+
+2. Download the asset for your OS:
+   - `dotest-vX.Y.Z-x86_64-pc-windows-msvc.zip`
+   - `dotest-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz`
+   - `dotest-vX.Y.Z-x86_64-apple-darwin.tar.gz`
+
+3. Extract and put the `dotest` binary in a folder on your `PATH`.
+
+On Windows, for example:
+```powershell
+Expand-Archive .\dotest-vX.Y.Z-x86_64-pc-windows-msvc.zip .\dotest
+Copy-Item .\dotest\dotest.exe "$env:USERPROFILE\\bin\\dotest.exe"
+```
+
+---
+
+### Build from Source
+
 Ensure you have [Rust and Cargo](https://rustup.rs/) installed to compile the application.
 
 1. Clone or download the repository:
@@ -19,6 +43,35 @@ Ensure you have [Rust and Cargo](https://rustup.rs/) installed to compile the ap
    cargo install --path .
    ```
    *(This will compile the application and place `dotest.exe` in your `.cargo/bin` folder, which should be in your PATH.)*
+
+---
+
+## Releasing a New Version
+
+The repository includes a GitHub Actions workflow that builds release binaries and publishes them as GitHub Release assets when a `v*` tag is pushed.
+
+1. Update `Cargo.toml` version:
+   ```toml
+   version = "0.2.1"
+   ```
+
+2. Commit and push:
+   ```bash
+   git add Cargo.toml Cargo.lock
+   git commit -m "release: v0.2.1"
+   git push
+   ```
+
+3. Create and push the release tag:
+   ```bash
+   git tag v0.2.1
+   git push origin v0.2.1
+   ```
+
+4. GitHub Actions will automatically:
+   - Build for Windows, Linux, and macOS
+   - Package archives with `README.md` and `LICENSE`
+   - Publish assets to the GitHub Release for that tag
 
 ---
 

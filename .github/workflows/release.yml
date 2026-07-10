@@ -4,7 +4,6 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
 
 permissions:
   contents: write
@@ -19,16 +18,22 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            dotnet_rid: linux-x64
             archive_ext: tar.gz
             bin_name: dotest
+            sidecar_name: dotest-churn-sidecar
           - os: macos-latest
             target: x86_64-apple-darwin
+            dotnet_rid: osx-x64
             archive_ext: tar.gz
             bin_name: dotest
+            sidecar_name: dotest-churn-sidecar
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            dotnet_rid: win-x64
             archive_ext: zip
             bin_name: dotest.exe
+            sidecar_name: dotest-churn-sidecar.exe
 
     steps:
       - name: Checkout
@@ -39,11 +44,28 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
 
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Publish churn sidecar
+        run: >
+          dotnet publish dotest-churn-sidecar/Dotest.ChurnSidecar.csproj
+          -c Release
+          -r ${{ matrix.dotnet_rid }}
+          --self-contained false
+          -o sidecar-publish
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:DebugType=None
+          -p:DebugSymbols=false
 
       - name: Package archive (Unix)
         if: runner.os != 'Windows'
@@ -52,6 +74,8 @@ jobs:
           ASSET_NAME="dotest-${{ github.ref_name }}-${{ matrix.target }}"
           mkdir "$ASSET_NAME"
           cp "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" "$ASSET_NAME/"
+          cp "sidecar-publish/${{ matrix.sidecar_name }}" "$ASSET_NAME/"
+          chmod +x "$ASSET_NAME/${{ matrix.bin_name }}" "$ASSET_NAME/${{ matrix.sidecar_name }}"
           cp README.md LICENSE "$ASSET_NAME/"
           tar -czf "$ASSET_NAME.tar.gz" "$ASSET_NAME"
           echo "ASSET_PATH=$ASSET_NAME.tar.gz" >> "$GITHUB_ENV"
@@ -63,6 +87,7 @@ jobs:
           $assetName = "dotest-${{ github.ref_name }}-${{ matrix.target }}"
           New-Item -ItemType Directory -Path $assetName | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" "$assetName/"
+          Copy-Item "sidecar-publish/${{ matrix.sidecar_name }}" "$assetName/"
           Copy-Item README.md "$assetName/"
           Copy-Item LICENSE "$assetName/"
           Compress-Archive -Path "$assetName/*" -DestinationPath "$assetName.zip"

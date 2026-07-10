@@ -18,19 +18,23 @@ Instead of wading through verbose `dotnet test` console outputs and manually wri
    - `dotest-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz`
    - `dotest-vX.Y.Z-x86_64-apple-darwin.tar.gz`
 
-3. Extract and put the `dotest` binary in a folder on your `PATH`.
+3. Extract the archive and put **both** binaries on your `PATH` (keep them in the same folder):
+   - `dotest` / `dotest.exe`
+   - `dotest-churn-sidecar` / `dotest-churn-sidecar.exe`
 
 On Windows, for example:
 ```powershell
-Expand-Archive .\dotest-vX.Y.Z-x86_64-pc-windows-msvc.zip .\dotest
-Copy-Item .\dotest\dotest.exe "$env:USERPROFILE\\bin\\dotest.exe"
+Expand-Archive .\dotest-vX.Y.Z-x86_64-pc-windows-msvc.zip $env:USERPROFILE\bin\dotest
+# Add $env:USERPROFILE\bin\dotest to your user PATH, then restart the terminal.
 ```
+
+Requires the .NET 8+ SDK/runtime on `PATH` (`dotnet`), which you already need to run tests.
 
 ---
 
 ### Build from Source
 
-Ensure you have [Rust and Cargo](https://rustup.rs/) installed to compile the application.
+Ensure you have [Rust and Cargo](https://rustup.rs/) and the [.NET SDK](https://dotnet.microsoft.com/download) installed.
 
 1. Clone or download the repository:
    ```bash
@@ -42,37 +46,39 @@ Ensure you have [Rust and Cargo](https://rustup.rs/) installed to compile the ap
    ```bash
    cargo install --path .
    ```
-   *(This will compile the application and place `dotest.exe` in your `.cargo/bin` folder, which should be in your PATH.)*
+   *(This places `dotest` in `.cargo/bin`. Churn uses `dotnet run` against `dotest-churn-sidecar/` in this source tree, so keep the checkout.)*
 
 ---
 
 ## Releasing a New Version
 
-The repository includes a GitHub Actions workflow that builds release binaries and publishes them as GitHub Release assets when a `v*` tag is pushed.
+The repository includes a GitHub Actions workflow that builds release binaries (including the churn sidecar) and publishes them as GitHub Release assets when a `v*` tag is pushed.
 
 1. Update `Cargo.toml` version:
    ```toml
-   version = "0.2.1"
+   version = "0.3.0"
    ```
 
-2. Commit and push:
+2. Commit everything for the release and push `main`:
    ```bash
-   git add Cargo.toml Cargo.lock
-   git commit -m "release: v0.2.1"
-   git push
+   git add -A
+   git commit -m "release: v0.3.0"
+   git push origin main
    ```
 
-3. Create and push the release tag:
+3. Create and push the release tag on that commit:
    ```bash
-   git tag v0.2.1
-   git push origin v0.2.1
+   git tag v0.3.0
+   git push origin v0.3.0
    ```
 
 4. GitHub Actions will automatically:
-   - Build for Windows, Linux, and macOS
-   - Package archives with `README.md` and `LICENSE`
-   - Publish assets to the GitHub Release for that tag
+   - Build `dotest` for Windows, Linux, and macOS
+   - Publish `dotest-churn-sidecar` for each OS
+   - Package both binaries with `README.md` and `LICENSE`
+   - Publish the archives to the GitHub Release for that tag
 
+Watch progress at: `https://github.com/joatansampaio/dotest/actions`
 ---
 
 ## Usage

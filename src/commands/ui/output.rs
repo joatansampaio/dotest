@@ -29,10 +29,48 @@ pub(super) struct ChurnSidecarRequest {
     pub no_restore: bool,
 }
 
-fn churn_sidecar_project_path() -> std::path::PathBuf {
+fn churn_sidecar_exe_name() -> &'static str {
+    if cfg!(windows) {
+        "dotest-churn-sidecar.exe"
+    } else {
+        "dotest-churn-sidecar"
+    }
+}
+
+fn churn_sidecar_dev_project_path() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("dotest-churn-sidecar")
         .join("Dotest.ChurnSidecar.csproj")
+}
+
+/// Prefer a published sidecar next to `dotest` (release installs).
+/// Fall back to `dotnet run` against the source project for local `cargo run` / `cargo install --path`.
+fn resolve_churn_sidecar_command() -> Result<std::process::Command> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sibling = dir.join(churn_sidecar_exe_name());
+            if sibling.is_file() {
+                return Ok(std::process::Command::new(sibling));
+            }
+        }
+    }
+
+    let project = churn_sidecar_dev_project_path();
+    if project.is_file() {
+        let mut cmd = std::process::Command::new("dotnet");
+        cmd.arg("run")
+            .arg("--project")
+            .arg(project)
+            .arg("-v")
+            .arg("q")
+            .arg("--");
+        return Ok(cmd);
+    }
+
+    anyhow::bail!(
+        "Churn sidecar not found. Keep `{}` next to the `dotest` binary (release archive), or run from a source checkout.",
+        churn_sidecar_exe_name()
+    )
 }
 
 pub(super) fn spawn_test_run(
@@ -113,14 +151,8 @@ pub(super) fn spawn_churn_sidecar(
     std::fs::write(&request_path, request_json)
         .with_context(|| format!("could not write sidecar request file at {}", request_path.display()))?;
 
-    let mut cmd = std::process::Command::new("dotnet");
-    cmd.arg("run")
-        .arg("--project")
-        .arg(churn_sidecar_project_path())
-        .arg("-v")
-        .arg("q")
-        .arg("--")
-        .arg("--request-file")
+    let mut cmd = resolve_churn_sidecar_command()?;
+    cmd.arg("--request-file")
         .arg(&request_path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

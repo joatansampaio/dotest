@@ -4,3 +4,7 @@
 /smoke/**/bin/
 /smoke/**/obj/
 *.lscache
+
+# C# bin
+bin/
+obj

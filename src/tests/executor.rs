@@ -1,8 +1,17 @@
+use crate::core::discovery::DiscoveredTest;
 use crate::core::executor::{
     build_discovery_entries, enrich, extract_class_name, extract_method_name,
     format_discovery_failure, is_test_attribute, parse_cs_content, strip_params,
 };
 use std::collections::HashMap;
+
+fn source_method(folder: &str, qualified_class: &str) -> (String, String, String) {
+    (
+        folder.to_string(),
+        qualified_class.to_string(),
+        "tests/Project.Tests.csproj".to_string(),
+    )
+}
 
 /// Parametric tests: many `dotnet test -t` lines map to one source method → one leaf, merged count.
 #[test]
@@ -10,7 +19,7 @@ fn test_build_discovery_parametric_collapses_to_one_row() {
     let mut methods = HashMap::new();
     methods.insert(
         "ValueTypes".to_string(),
-        vec![("Tests".to_string(), "Ns.Tests.JsonTests".to_string())],
+        vec![source_method("Tests", "Ns.Tests.JsonTests")],
     );
     let display_names = vec![
         "ValueTypes(\"1\")".to_string(),
@@ -24,7 +33,7 @@ fn test_build_discovery_parametric_collapses_to_one_row() {
         1,
         "same method, multiple list lines -> one row with merged count"
     );
-    assert_eq!(out[0].2, 3);
+    assert_eq!(out[0].test_count, 3);
 }
 
 /// UTF-8 BOM before `namespace` must not hide the namespace (Visual Studio default for new files).
@@ -39,7 +48,7 @@ fn test_parse_cs_content_utf8_bom_before_namespace() {
         methods.contains_key("M"),
         "method should be found when BOM precedes namespace"
     );
-    let (_, qc) = &methods["M"][0];
+    let (_, qc, _) = &methods["M"][0];
     assert!(
         qc.starts_with("Acme.Tests."),
         "qualified class should include namespace, got {}",
@@ -102,16 +111,13 @@ fn test_tree_fqn_disk_folder_then_class_method() {
     let mut methods = HashMap::new();
     methods.insert(
         "DoThing".to_string(),
-        vec![(
-            "Groups".to_string(),
-            "Tmly.Test.Groups.OrgTreeTests".to_string(),
-        )],
+        vec![source_method("Groups", "Tmly.Test.Groups.OrgTreeTests")],
     );
     let display_names = vec!["DoThing(\"a\")".to_string()];
     let class_map = HashMap::new();
     let out = build_discovery_entries(&display_names, &methods, &class_map);
-    assert_eq!(out[0].0, "Groups.OrgTreeTests.DoThing");
-    assert_eq!(out[0].1, "Tmly.Test.Groups.OrgTreeTests.DoThing");
+    assert_eq!(out[0].tree_path, "Groups.OrgTreeTests.DoThing");
+    assert_eq!(out[0].filter_key, "Tmly.Test.Groups.OrgTreeTests.DoThing");
 }
 
 /// When many list lines share a short name across several classes, distribute rows round-robin
@@ -122,8 +128,8 @@ fn test_build_discovery_ambiguous_round_robin_parametric() {
     methods.insert(
         "Dup".to_string(),
         vec![
-            ("F1".to_string(), "Ns.Alpha.C1".to_string()),
-            ("F1".to_string(), "Ns.Beta.C2".to_string()),
+            source_method("F1", "Ns.Alpha.C1"),
+            source_method("F1", "Ns.Beta.C2"),
         ],
     );
     // folder F1 + qualified Ns.Alpha.C1 / Ns.Beta.C2 → tree path F1.C1.Dup / F1.C2.Dup
@@ -137,13 +143,13 @@ fn test_build_discovery_ambiguous_round_robin_parametric() {
     let out = build_discovery_entries(&display_names, &methods, &class_map);
     let c1: usize = out
         .iter()
-        .filter(|(t, _, _)| t.contains("F1.C1.Dup"))
-        .map(|(_, _, c)| c)
+        .filter(|test| test.tree_path.contains("F1.C1.Dup"))
+        .map(|test| test.test_count)
         .sum();
     let c2: usize = out
         .iter()
-        .filter(|(t, _, _)| t.contains("F1.C2.Dup"))
-        .map(|(_, _, c)| c)
+        .filter(|test| test.tree_path.contains("F1.C2.Dup"))
+        .map(|test| test.test_count)
         .sum();
     assert_eq!(c1, 2, "round-robin: 4 lines / 2 classes");
     assert_eq!(c2, 2);
@@ -156,13 +162,10 @@ fn test_build_discovery_duplicate_short_method_names_one_row_per_class() {
     methods.insert(
         "SmokeTest".to_string(),
         vec![
-            (
-                "Imports".to_string(),
-                "Tmly.Test.Imports.ImportRollupTests".to_string(),
-            ),
-            (
-                "ImportLookupCluesTest".to_string(),
-                "Tmly.Test.Imports.ImportLookupCluesTest".to_string(),
+            source_method("Imports", "Tmly.Test.Imports.ImportRollupTests"),
+            source_method(
+                "ImportLookupCluesTest",
+                "Tmly.Test.Imports.ImportLookupCluesTest",
             ),
         ],
     );
@@ -170,7 +173,7 @@ fn test_build_discovery_duplicate_short_method_names_one_row_per_class() {
     let class_map = HashMap::new();
     let out = build_discovery_entries(&display_names, &methods, &class_map);
     assert_eq!(out.len(), 2);
-    assert_eq!(out.iter().map(|(_, _, c)| c).sum::<usize>(), 2);
+    assert_eq!(out.iter().map(|test| test.test_count).sum::<usize>(), 2);
 }
 
 #[test]
@@ -497,7 +500,7 @@ public class IfWorkedRuleTests : ConversionRuleTests {
     );
 
     // Verify folder mapping is correct for each method
-    let (folder, qc) = &methods["GroupingRule_Simple"][0];
+    let (folder, qc, _) = &methods["GroupingRule_Simple"][0];
     assert_eq!(folder, "Conversion.Rules");
     assert!(
         qc.ends_with(".IfWorkedRuleTests"),
@@ -559,7 +562,7 @@ public class BreakTests {
         "NotifyUserOfInactivatedPurchaseOrder",
         "NormalTest",
     ] {
-        let (folder, qc) = &methods[*name][0];
+        let (folder, qc, _) = &methods[*name][0];
         assert_eq!(folder, "Integration", "Wrong folder for {}", name);
         assert_eq!(qc, "BreakTests", "Wrong class for {}", name);
     }
@@ -657,16 +660,16 @@ public class OrgTreeTests {
         .iter()
         .filter(|(_, vecs)| {
             vecs.iter()
-                .any(|(_, qc)| qc_is_class(qc, "GroupQueryHandlerTest"))
+                .any(|(_, qc, _)| qc_is_class(qc, "GroupQueryHandlerTest"))
         })
         .collect();
     let group_methods: Vec<_> = methods
         .iter()
-        .filter(|(_, vecs)| vecs.iter().any(|(_, qc)| qc_is_class(qc, "GroupTests")))
+        .filter(|(_, vecs)| vecs.iter().any(|(_, qc, _)| qc_is_class(qc, "GroupTests")))
         .collect();
     let org_methods: Vec<_> = methods
         .iter()
-        .filter(|(_, vecs)| vecs.iter().any(|(_, qc)| qc_is_class(qc, "OrgTreeTests")))
+        .filter(|(_, vecs)| vecs.iter().any(|(_, qc, _)| qc_is_class(qc, "OrgTreeTests")))
         .collect();
 
     assert_eq!(
@@ -695,21 +698,9 @@ fn test_tree_test_count_for_parameterised_tests() {
     // - ParamTest has 5 instances ([TestCase] x5)
     // - AnotherTest has 3 instances
     let tests = vec![
-        (
-            "Folder.MyClass.SimpleTest".to_string(),
-            "Ns.Folder.MyClass.SimpleTest".to_string(),
-            1,
-        ),
-        (
-            "Folder.MyClass.ParamTest".to_string(),
-            "Ns.Folder.MyClass.ParamTest".to_string(),
-            5,
-        ),
-        (
-            "Folder.MyClass.AnotherTest".to_string(),
-            "Ns.Folder.MyClass.AnotherTest".to_string(),
-            3,
-        ),
+        DiscoveredTest::new("Folder.MyClass.SimpleTest", "Ns.Folder.MyClass.SimpleTest", 1),
+        DiscoveredTest::new("Folder.MyClass.ParamTest", "Ns.Folder.MyClass.ParamTest", 5),
+        DiscoveredTest::new("Folder.MyClass.AnotherTest", "Ns.Folder.MyClass.AnotherTest", 3),
     ];
 
     let tree = build_flat_tree(&tests);
@@ -755,9 +746,9 @@ fn test_build_discovery_fqn_aware_matching() {
     // Source parsing found: Placement_Primary in Tmly.Test.Infrastructure.BaseQueryHelperTests
     methods.insert(
         "Placement_Primary".to_string(),
-        vec![(
-            "Infrastructure".to_string(),
-            "Tmly.Test.Infrastructure.BaseQueryHelperTests".to_string(),
+        vec![source_method(
+            "Infrastructure",
+            "Tmly.Test.Infrastructure.BaseQueryHelperTests",
         )],
     );
 
@@ -770,11 +761,11 @@ fn test_build_discovery_fqn_aware_matching() {
 
     assert_eq!(out.len(), 1);
     assert_eq!(
-        out[0].0, "Infrastructure.BaseQueryHelperTests.Placement_Primary",
+        out[0].tree_path, "Infrastructure.BaseQueryHelperTests.Placement_Primary",
         "Should use correct folder-prefixed tree FQN"
     );
     assert_eq!(
-        out[0].1, "Tmly.Test.Infrastructure.BaseQueryHelperTests.Placement_Primary",
+        out[0].filter_key, "Tmly.Test.Infrastructure.BaseQueryHelperTests.Placement_Primary",
         "Filter key should be the FQN"
     );
 }

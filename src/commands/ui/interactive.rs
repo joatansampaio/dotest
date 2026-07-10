@@ -1,4 +1,5 @@
-use crate::core::executor::discover_tests;
+use crate::core::discovery::DiscoveredTest;
+use crate::core::executor::{compose_test_filter, discover_tests};
 use crate::core::tree::{build_flat_tree, sync_parents, TreeNode, TreeState};
 use anyhow::Result;
 use arboard::Clipboard;
@@ -39,14 +40,17 @@ use ratatui::{
 };
 
 use super::config::{OutputMode, RunConfig, Verbosity};
-use super::filter::build_filter;
+use super::filter::{build_filter, build_selected_run_request};
 use super::layout::{
     centered_rect, format_elapsed, output_wrapped_scroll_max, styled_output_lines,
 };
-use super::output::{kill_process, spawn_test_run, OutputEvent};
+use super::output::{
+    kill_process, spawn_churn_sidecar, spawn_test_run_for_target, ChurnSidecarRequest,
+    OutputEvent,
+};
 use super::presets::{apply_preset_selection, collect_selected_tests, save_preset};
 
-type DiscoveryEntries = Vec<(String, String, usize)>;
+type DiscoveryEntries = Vec<DiscoveredTest>;
 type RediscoveryResult = std::result::Result<DiscoveryEntries, String>;
 
 const DEFAULT_TESTS_PANE_PERCENT: u16 = 22;
@@ -55,6 +59,8 @@ const MIN_TESTS_PANE_ROWS: u16 = 3;
 const MIN_OUTPUT_PANE_ROWS: u16 = 1;
 const STATUS_PANE_ROWS: u16 = 3;
 const QUICK_CHURN_LIMIT: usize = 100;
+const CHURN_OUTPUT_TAIL_LINES: usize = 400;
+const CHURN_OUTPUT_OMITTED_MARKER: &str = "  ... older churn output omitted ...";
 
 fn churn_duration_stats_line(durations: &[Duration]) -> Option<String> {
     if durations.is_empty() {
@@ -74,6 +80,47 @@ fn churn_duration_stats_line(durations: &[Duration]) -> Option<String> {
         format_elapsed(min),
         format_elapsed(max)
     ))
+}
+
+fn parse_churn_iteration_line(line: &str, marker: &str) -> Option<usize> {
+    let rest = line.strip_prefix("Iteration ")?;
+    let (iteration, suffix) = rest.split_once(' ')?;
+    if !suffix.contains(marker) {
+        return None;
+    }
+    iteration.parse().ok()
+}
+
+fn parse_churn_iteration_start_line(line: &str) -> Option<usize> {
+    parse_churn_iteration_line(line, "↻ Starting")
+}
+
+fn parse_churn_iteration_passed_line(line: &str) -> Option<usize> {
+    parse_churn_iteration_line(line, "✓ Passed")
+}
+
+fn parse_churn_iteration_failed_line(line: &str) -> Option<usize> {
+    parse_churn_iteration_line(line, "✗ Failed")
+}
+
+fn churn_output_prefix_lines(output_lines: &[String]) -> usize {
+    match output_lines.get(1) {
+        Some(line) if line.starts_with("  Iteration limit:") => output_lines.len().min(2),
+        _ => output_lines.len().min(1),
+    }
+}
+
+fn trim_churn_output_lines(output_lines: &mut Vec<String>) {
+    let prefix_len = churn_output_prefix_lines(output_lines);
+    if output_lines.len() <= prefix_len + CHURN_OUTPUT_TAIL_LINES {
+        return;
+    }
+
+    let tail_start = output_lines.len().saturating_sub(CHURN_OUTPUT_TAIL_LINES);
+    let mut tail = output_lines.split_off(tail_start);
+    output_lines.truncate(prefix_len);
+    output_lines.push(CHURN_OUTPUT_OMITTED_MARKER.to_string());
+    output_lines.append(&mut tail);
 }
 
 fn clamp_tests_pane_rows(rows: u16, terminal_height: u16) -> u16 {
@@ -141,6 +188,8 @@ pub(super) fn run_interactive_loop(
     let mut churn_iteration: usize = 0;
     let mut churn_limit: Option<usize> = None;
     let mut churn_filter: Option<String> = None;
+    let mut churn_target_path: Option<String> = None;
+    let mut churn_using_sidecar = false;
     let mut churn_successes_before_failure: usize = 0;
     let mut churn_durations: Vec<Duration> = Vec::new();
     let mut failed_tests: Vec<FailedTestInfo> = Vec::new();
@@ -217,17 +266,52 @@ pub(super) fn run_interactive_loop(
                             }
                         }
 
+                        if is_churning && churn_using_sidecar {
+                            if let Some(iteration) = parse_churn_iteration_start_line(trimmed) {
+                                churn_iteration = iteration;
+                                run_passed = 0;
+                                run_failed = 0;
+                                run_skipped = 0;
+                                run_start = Some(Instant::now());
+                            } else if let Some(iteration) =
+                                parse_churn_iteration_passed_line(trimmed)
+                            {
+                                churn_successes_before_failure = iteration;
+                            } else if let Some(iteration) =
+                                parse_churn_iteration_failed_line(trimmed)
+                            {
+                                churn_iteration = iteration;
+                            }
+                        }
+
                         output_lines.push(line);
-                        failed_tests = extract_failed_tests(&output_lines);
-                        if failed_tests.is_empty() {
-                            failed_selection = 0;
-                            failed_detail_scroll = 0;
-                        } else {
-                            failed_selection = failed_selection.min(failed_tests.len() - 1);
+                        if is_churning {
+                            trim_churn_output_lines(&mut output_lines);
                         }
                     }
                     Ok(OutputEvent::Finished(code)) => {
                         if is_churning {
+                            if churn_using_sidecar {
+                                is_running = false;
+                                is_churning = false;
+                                churn_using_sidecar = false;
+                                run_pid = None;
+                                output_rx = None;
+
+                                failed_tests = extract_failed_tests(&output_lines);
+                                if code != Some(0) && !failed_tests.is_empty() {
+                                    show_failure_summary = true;
+                                    failed_selection = 0;
+                                    failed_detail_scroll = 0;
+                                    failure_detail_hover = None;
+                                }
+
+                                churn_filter = None;
+                                churn_limit = None;
+                                churn_target_path = None;
+                                continue;
+                            }
+
                             let elapsed_duration = run_start.map(|s| s.elapsed());
                             let elapsed = elapsed_duration
                                 .map(format_elapsed)
@@ -278,6 +362,8 @@ pub(super) fn run_interactive_loop(
 
                                     churn_filter = None;
                                     churn_limit = None;
+                                    churn_target_path = None;
+                                    churn_using_sidecar = false;
                                 } else if let Some(filter) = churn_filter.clone() {
                                     churn_iteration += 1;
                                     run_passed = 0;
@@ -285,12 +371,19 @@ pub(super) fn run_interactive_loop(
                                     run_skipped = 0;
                                     output_lines
                                         .push(format!("Iteration {}   ↻ Starting", churn_iteration));
+                                    trim_churn_output_lines(&mut output_lines);
 
                                     let mut churn_run_config = run_config.clone();
                                     churn_run_config.no_build = true;
                                     churn_run_config.no_restore = true;
+                                    // Churn favors throughput; keep log volume low per iteration.
+                                    churn_run_config.verbosity = Verbosity::Minimal;
 
-                                    match spawn_test_run(Some(filter), &churn_run_config) {
+                                    match spawn_test_run_for_target(
+                                        Some(filter),
+                                        churn_target_path.as_deref(),
+                                        &churn_run_config,
+                                    ) {
                                         Ok((rx, pid)) => {
                                             output_rx = Some(rx);
                                             run_pid = Some(pid);
@@ -308,6 +401,8 @@ pub(super) fn run_interactive_loop(
                                             ));
                                             churn_filter = None;
                                             churn_limit = None;
+                                            churn_target_path = None;
+                                            churn_using_sidecar = false;
                                         }
                                     }
                                 } else {
@@ -319,7 +414,9 @@ pub(super) fn run_interactive_loop(
                                         "✗ Churn stopped: missing test filter for next iteration."
                                             .to_string(),
                                     );
+                                    churn_target_path = None;
                                     churn_limit = None;
+                                    churn_using_sidecar = false;
                                 }
                             } else {
                                 is_running = false;
@@ -367,6 +464,8 @@ pub(super) fn run_interactive_loop(
 
                                 churn_filter = None;
                                 churn_limit = None;
+                                churn_target_path = None;
+                                churn_using_sidecar = false;
                             }
                         } else {
                             is_running = false;
@@ -441,7 +540,7 @@ pub(super) fn run_interactive_loop(
                     *tree = new_tree;
                     state.select(Some(0));
                     search_query.clear();
-                    let total: usize = tests.iter().map(|(_, _, c)| c).sum();
+                    let total: usize = tests.iter().map(|test| test.test_count).sum();
                     output_lines.push(format!(
                         "✓ Found {} tests ({} methods).",
                         total,
@@ -1875,6 +1974,8 @@ pub(super) fn run_interactive_loop(
                                 is_churning = false;
                                 churn_filter = None;
                                 churn_limit = None;
+                                churn_target_path = None;
+                                churn_using_sidecar = false;
                                 output_rx = None;
                             }
                             _ => {}
@@ -1932,8 +2033,11 @@ pub(super) fn run_interactive_loop(
                     if key.modifiers.contains(KeyModifiers::CONTROL)
                         && matches!(key.code, KeyCode::Char('u' | 'U'))
                     {
-                        let filter = build_filter(tree);
-                        if let Some(filter_str) = filter {
+                        if let Some(run_request) = build_selected_run_request(tree) {
+                            let filter_str = run_request.filter;
+                            let sidecar_filter = run_request.sidecar_filter;
+                            let target_path = run_request.target_path;
+                            let test_names = run_request.test_names;
                             let quick_limit = key.modifiers.contains(KeyModifiers::SHIFT)
                                 || matches!(key.code, KeyCode::Char('U'));
                             let limit = if quick_limit {
@@ -1960,7 +2064,9 @@ pub(super) fn run_interactive_loop(
                             is_churning = true;
                             churn_iteration = 1;
                             churn_limit = limit;
-                            churn_filter = Some(filter_str.clone());
+                            churn_filter = None;
+                            churn_target_path = target_path.clone();
+                            churn_using_sidecar = target_path.is_some();
                             churn_successes_before_failure = 0;
                             churn_durations.clear();
 
@@ -1977,11 +2083,37 @@ pub(super) fn run_interactive_loop(
                             output_lines.push("Iteration 1   ↻ Starting".to_string());
                             output_lines.push(String::new());
 
-                            let mut first_churn_run_config = run_config.clone();
-                            first_churn_run_config.no_build = false;
-                            first_churn_run_config.no_restore = true;
+                            let spawn_result = if let Some(target_path) = target_path.clone() {
+                                let request = ChurnSidecarRequest {
+                                    repo_root: root_dir.display().to_string(),
+                                    target_path,
+                                    filter: compose_test_filter(Some(sidecar_filter)),
+                                    test_names,
+                                    iteration_limit: limit,
+                                    no_build: run_config.no_build,
+                                    no_restore: run_config.no_restore,
+                                };
+                                spawn_churn_sidecar(&request)
+                            } else {
+                                churn_filter = Some(filter_str.clone());
+                                churn_using_sidecar = false;
 
-                            match spawn_test_run(Some(filter_str), &first_churn_run_config) {
+                                let mut first_churn_run_config = run_config.clone();
+                                // Respect the user's run settings; forcing a build here adds
+                                // unnecessary startup time before churn begins.
+                                first_churn_run_config.no_build = run_config.no_build;
+                                first_churn_run_config.no_restore = run_config.no_restore;
+                                // Churn favors throughput; keep log volume low per iteration.
+                                first_churn_run_config.verbosity = Verbosity::Minimal;
+
+                                spawn_test_run_for_target(
+                                    Some(filter_str),
+                                    churn_target_path.as_deref(),
+                                    &first_churn_run_config,
+                                )
+                            };
+
+                            match spawn_result {
                                 Ok((rx, pid)) => {
                                     output_rx = Some(rx);
                                     run_pid = Some(pid);
@@ -1997,6 +2129,8 @@ pub(super) fn run_interactive_loop(
                                     is_churning = false;
                                     churn_filter = None;
                                     churn_limit = None;
+                                    churn_target_path = None;
+                                    churn_using_sidecar = false;
                                     output_lines.push(format!("Error: {e}"));
                                 }
                             }
@@ -2012,6 +2146,7 @@ pub(super) fn run_interactive_loop(
                     if key.modifiers.contains(KeyModifiers::CONTROL)
                         && key.code == KeyCode::Char('e')
                     {
+                        failed_tests = extract_failed_tests(&output_lines);
                         show_failure_summary = true;
                         if failed_tests.is_empty() {
                             failed_selection = 0;

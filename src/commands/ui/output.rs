@@ -1,9 +1,12 @@
-use crate::core::executor::build_test_command;
-use anyhow::Result;
+use crate::core::executor::build_test_command_for_target;
+use anyhow::{Context, Result};
+use serde::Serialize;
 use std::io::Read;
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::mpsc;
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::config::{RunConfig, Verbosity};
 
@@ -15,8 +18,33 @@ pub(super) enum OutputEvent {
     Finished(Option<i32>),
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct ChurnSidecarRequest {
+    pub repo_root: String,
+    pub target_path: String,
+    pub filter: Option<String>,
+    pub test_names: Vec<String>,
+    pub iteration_limit: Option<usize>,
+    pub no_build: bool,
+    pub no_restore: bool,
+}
+
+fn churn_sidecar_project_path() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("dotest-churn-sidecar")
+        .join("Dotest.ChurnSidecar.csproj")
+}
+
 pub(super) fn spawn_test_run(
     filter: Option<String>,
+    config: &RunConfig,
+) -> Result<(mpsc::Receiver<OutputEvent>, u32)> {
+    spawn_test_run_for_target(filter, None, config)
+}
+
+pub(super) fn spawn_test_run_for_target(
+    filter: Option<String>,
+    target_override: Option<&str>,
     config: &RunConfig,
 ) -> Result<(mpsc::Receiver<OutputEvent>, u32)> {
     let (tx, rx) = mpsc::channel();
@@ -33,8 +61,9 @@ pub(super) fn spawn_test_run(
         _ => filter,
     };
 
-    let mut cmd = build_test_command(filter_arg, config.no_build, config.no_restore);
-    cmd.arg("-v").arg("m");
+    let mut cmd =
+        build_test_command_for_target(target_override, filter_arg, config.no_build, config.no_restore);
+    cmd.arg("--nologo").arg("-v").arg("m");
 
     match config.verbosity {
         Verbosity::Minimal => {
@@ -62,6 +91,55 @@ pub(super) fn spawn_test_run(
     thread::spawn(move || {
         let code = child.wait().ok().and_then(|s| s.code());
         let _ = tx3.send(OutputEvent::Finished(code));
+    });
+
+    Ok((rx, pid))
+}
+
+pub(super) fn spawn_churn_sidecar(
+    request: &ChurnSidecarRequest,
+) -> Result<(mpsc::Receiver<OutputEvent>, u32)> {
+    let (tx, rx) = mpsc::channel();
+    let request_json = serde_json::to_vec(request)?;
+    let request_stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let request_path = std::env::temp_dir().join(format!(
+        "dotest-churn-request-{}-{}.json",
+        std::process::id(),
+        request_stamp
+    ));
+    std::fs::write(&request_path, request_json)
+        .with_context(|| format!("could not write sidecar request file at {}", request_path.display()))?;
+
+    let mut cmd = std::process::Command::new("dotnet");
+    cmd.arg("run")
+        .arg("--project")
+        .arg(churn_sidecar_project_path())
+        .arg("-v")
+        .arg("q")
+        .arg("--")
+        .arg("--request-file")
+        .arg(&request_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn()?;
+    let pid = child.id();
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+
+    let tx_stdout = tx.clone();
+    let tx_stderr = tx.clone();
+
+    thread::spawn(move || pump_stream_lines(stdout, tx_stdout));
+    thread::spawn(move || pump_stream_lines(stderr, tx_stderr));
+    thread::spawn(move || {
+        let code = child.wait().ok().and_then(|s| s.code());
+        let _ = std::fs::remove_file(&request_path);
+        let _ = tx.send(OutputEvent::Finished(code));
     });
 
     Ok((rx, pid))

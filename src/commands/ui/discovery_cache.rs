@@ -5,8 +5,9 @@
 //! skips `bin`/`obj`/etc.). Generated files and unrelated git noise should not force a
 //! slow `dotnet test -t` rediscovery.
 
-use anyhow::{Context, Result};
+use crate::core::discovery::DiscoveredTest;
 use crate::core::tree::TreeState;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -19,7 +20,7 @@ pub(crate) const CACHE_PATH: &str = ".dotest_cache.json";
 #[derive(Serialize, Deserialize)]
 struct DiscoveryCacheFile {
     fingerprint: String,
-    tests: Vec<(String, String, usize)>,
+    tests: Vec<DiscoveredTest>,
     #[serde(default)]
     tree_state: Option<TreeState>,
 }
@@ -102,7 +103,7 @@ pub(crate) fn compute_source_fingerprint() -> String {
     filesystem_fingerprint()
 }
 
-pub(crate) fn try_load_cached_tests() -> Option<Vec<(String, String, usize)>> {
+pub(crate) fn try_load_cached_tests() -> Option<Vec<DiscoveredTest>> {
     let fp = compute_source_fingerprint();
     let s = fs::read_to_string(CACHE_PATH).ok()?;
     let file: DiscoveryCacheFile = serde_json::from_str(&s).ok()?;
@@ -113,7 +114,7 @@ pub(crate) fn try_load_cached_tests() -> Option<Vec<(String, String, usize)>> {
     }
 }
 
-pub(crate) fn save_discovery_cache(tests: &[(String, String, usize)]) -> Result<()> {
+pub(crate) fn save_discovery_cache(tests: &[DiscoveredTest]) -> Result<()> {
     if tests.is_empty() {
         return Ok(());
     }

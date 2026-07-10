@@ -97,6 +97,7 @@ mod tests {
             parent_idx: None,
             is_leaf: true,
             test_count: 1,
+            target_path: None,
         }
     }
 

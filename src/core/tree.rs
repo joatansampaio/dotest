@@ -1,3 +1,4 @@
+use crate::core::discovery::DiscoveredTest;
 use std::collections::{BTreeMap, HashMap};
 
 #[derive(Clone, Debug)]
@@ -18,12 +19,13 @@ pub struct TreeNode {
     /// For leaves: count of parameterised variants (e.g. [TestCase] produces N).
     /// For non-leaves: always 0 (use helper fn to sum children).
     pub test_count: usize,
+    pub target_path: Option<String>,
 }
 
 struct NodeBuilder {
     children: BTreeMap<String, NodeBuilder>,
-    /// (leaf_label, filter_key, test_count)
-    leaves: Vec<(String, String, usize)>,
+    /// (leaf_label, filter_key, test_count, target_path)
+    leaves: Vec<(String, String, usize, Option<String>)>,
 }
 
 impl NodeBuilder {
@@ -60,12 +62,13 @@ fn flatten_node(
             parent_idx,
             is_leaf: false,
             test_count: 0,
+            target_path: None,
         });
         flatten_node(child, flat, depth + 1, Some(idx), &new_prefix);
     }
 
     // Then leaf tests
-    for (label, filter_key, count) in &node.leaves {
+    for (label, filter_key, count, target_path) in &node.leaves {
         flat.push(TreeNode {
             label: label.clone(),
             fqn: Some(filter_key.clone()),
@@ -76,6 +79,7 @@ fn flatten_node(
             parent_idx,
             is_leaf: true,
             test_count: *count,
+            target_path: target_path.clone(),
         });
     }
 }
@@ -92,11 +96,11 @@ fn flatten_node(
 ///   - The last segment                  -> leaf test node
 ///
 /// Depth 0 = folder (pink), depth 1 = class (cyan), depth 2+ = test method.
-pub fn build_flat_tree(tests: &[(String, String, usize)]) -> Vec<TreeNode> {
+pub fn build_flat_tree(tests: &[DiscoveredTest]) -> Vec<TreeNode> {
     let mut root = NodeBuilder::new();
 
-    for (tree_fqn, filter_key, count) in tests {
-        let parts: Vec<&str> = tree_fqn.split('.').collect();
+    for test in tests {
+        let parts: Vec<&str> = test.tree_path.split('.').collect();
         let len = parts.len();
         if len == 0 {
             continue;
@@ -115,10 +119,17 @@ pub fn build_flat_tree(tests: &[(String, String, usize)]) -> Vec<TreeNode> {
         let leaf_label = parts[len - 1].to_string();
 
         // Deduplicate by filter_key (parameterised variants share the same base name)
-        if !current.leaves.iter().any(|(_, k, _)| k == filter_key) {
-            current
-                .leaves
-                .push((leaf_label, filter_key.clone(), *count));
+        if !current
+            .leaves
+            .iter()
+            .any(|(_, k, _, _)| k == &test.filter_key)
+        {
+            current.leaves.push((
+                leaf_label,
+                test.filter_key.clone(),
+                test.test_count,
+                test.target_path.clone(),
+            ));
         }
     }
 

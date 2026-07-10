@@ -1,4 +1,5 @@
 use crate::core::config::Config;
+use crate::core::discovery::DiscoveredTest;
 use anyhow::{bail, Context, Result};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -6,23 +7,32 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 static SELECTED_TEST_TARGET: OnceLock<Option<String>> = OnceLock::new();
+static EXCLUDED_CATEGORY_FILTER: OnceLock<Option<String>> = OnceLock::new();
 
-/// Returns `(tree_fqn, filter_key, test_count)` triples.
+type SourceMethod = (String, String, String);
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct TestProject {
+    root: PathBuf,
+    target_path: String,
+}
+
+/// Returns discovered test entries with tree paths, filter keys, counts, and owning targets.
 /// `filter_key` is a VSTest-friendly substring for `FullyQualifiedName~` (typically `Namespace.Class.Method`).
 /// `test_count` is the number of `dotnet test -t` lines for that logical test method.
-pub fn discover_tests(no_build: bool, no_restore: bool) -> Result<Vec<(String, String, usize)>> {
+pub fn discover_tests(no_build: bool, no_restore: bool) -> Result<Vec<DiscoveredTest>> {
     let target = resolve_test_target(false)?;
     let display_names = discover_display_names(target.as_deref(), no_build, no_restore)?;
     if display_names.is_empty() {
         return Ok(Vec::new());
     }
 
-    let test_roots = find_test_project_roots(Path::new("."), target.as_deref());
+    let test_projects = find_test_projects(Path::new("."), target.as_deref());
 
-    let mut method_map: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    let mut method_map: HashMap<String, Vec<SourceMethod>> = HashMap::new();
     let mut class_map = HashMap::new();
-    for root in &test_roots {
-        let (m, c) = scan_source_maps(root);
+    for project in &test_projects {
+        let (m, c) = scan_source_maps(&project.root, &project.target_path);
         for (k, mut v) in m {
             method_map.entry(k).or_default().append(&mut v);
         }
@@ -42,9 +52,9 @@ pub fn discover_tests(no_build: bool, no_restore: bool) -> Result<Vec<(String, S
 /// Maps each `dotnet test -t` line to a source method, merges counts, and builds vstest filter keys.
 pub(crate) fn build_discovery_entries(
     display_names: &[String],
-    methods: &HashMap<String, Vec<(String, String)>>,
+    methods: &HashMap<String, Vec<SourceMethod>>,
     class_map: &HashMap<String, String>,
-) -> Vec<(String, String, usize)> {
+) -> Vec<DiscoveredTest> {
     let flat_for_enrich = flatten_methods_for_enrich(methods);
 
     // Group list indices by short method name (order within group: sorted display string)
@@ -54,7 +64,7 @@ pub(crate) fn build_discovery_entries(
         by_short.entry(short).or_default().push((i, dn.clone()));
     }
 
-    let mut per_line: Vec<Option<(String, String)>> = vec![None; display_names.len()];
+    let mut per_line: Vec<Option<SourceMethod>> = vec![None; display_names.len()];
 
     for (short_and_class, mut group) in by_short {
         group.sort_by(|a, b| a.1.cmp(&b.1));
@@ -73,9 +83,9 @@ pub(crate) fn build_discovery_entries(
         let mut matching_cands = Vec::new();
         if parts.len() > 1 {
             let prefix = parts[..parts.len() - 1].join(".");
-            for (folder, qualified_class) in &cands {
-                if prefix == *qualified_class {
-                    matching_cands.push((folder.clone(), qualified_class.clone()));
+            for cand in &cands {
+                if prefix == cand.1 {
+                    matching_cands.push(cand.clone());
                 }
             }
         }
@@ -97,28 +107,31 @@ pub(crate) fn build_discovery_entries(
         }
     }
 
-    let mut out: Vec<(String, String, usize)> = Vec::new();
+    let mut out: Vec<DiscoveredTest> = Vec::new();
     let mut key_pos: HashMap<String, usize> = HashMap::new();
 
     for (i, dn) in display_names.iter().enumerate() {
         let short = strip_params(dn);
-        let (tree_fqn, fk) = match &per_line[i] {
-            Some((folder, qc)) => {
+        let entry = match &per_line[i] {
+            Some((folder, qc, target_path)) => {
                 let simple_method = short.rsplit('.').next().unwrap_or(&short);
                 let fk = qualified_filter_key(qc, simple_method);
                 let tree = tree_fqn_from_qualified(folder, qc, simple_method);
-                (tree, fk)
+                DiscoveredTest::new(tree, fk, 1).with_target(target_path.clone())
             }
             None => {
                 let tree = enrich(&short, &flat_for_enrich, class_map);
-                (tree, short.clone())
+                DiscoveredTest::new(tree, short.clone(), 1)
             }
         };
-        if let Some(&pos) = key_pos.get(&fk) {
-            out[pos].2 += 1;
+        if let Some(&pos) = key_pos.get(&entry.filter_key) {
+            out[pos].test_count += 1;
+            if out[pos].target_path != entry.target_path {
+                out[pos].target_path = None;
+            }
         } else {
-            key_pos.insert(fk.clone(), out.len());
-            out.push((tree_fqn, fk, 1));
+            key_pos.insert(entry.filter_key.clone(), out.len());
+            out.push(entry);
         }
     }
 
@@ -145,12 +158,12 @@ fn tree_fqn_from_qualified(folder: &str, qualified_class: &str, short_method: &s
 }
 
 fn flatten_methods_for_enrich(
-    methods: &HashMap<String, Vec<(String, String)>>,
+    methods: &HashMap<String, Vec<SourceMethod>>,
 ) -> HashMap<String, (String, String)> {
     methods
         .iter()
         .filter_map(|(short, v)| {
-            v.first().map(|(folder, qc)| {
+            v.first().map(|(folder, qc, _)| {
                 let cls_simple = qc.rsplit('.').next().unwrap_or(qc.as_str()).to_string();
                 (short.clone(), (folder.clone(), cls_simple))
             })
@@ -324,20 +337,22 @@ pub(crate) fn enrich(
 ///   class_map:  simple class_name  -> relative_folder
 fn scan_source_maps(
     root: &Path,
+    target_path: &str,
 ) -> (
-    HashMap<String, Vec<(String, String)>>,
+    HashMap<String, Vec<SourceMethod>>,
     HashMap<String, String>,
 ) {
-    let mut method_map: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    let mut method_map: HashMap<String, Vec<SourceMethod>> = HashMap::new();
     let mut class_map: HashMap<String, String> = HashMap::new();
-    walk_cs(root, root, &mut method_map, &mut class_map, 0);
+    walk_cs(root, root, target_path, &mut method_map, &mut class_map, 0);
     (method_map, class_map)
 }
 
 fn walk_cs(
     root: &Path,
     dir: &Path,
-    methods: &mut HashMap<String, Vec<(String, String)>>,
+    target_path: &str,
+    methods: &mut HashMap<String, Vec<SourceMethod>>,
     classes: &mut HashMap<String, String>,
     depth: usize,
 ) {
@@ -355,13 +370,13 @@ fn walk_cs(
             if name.starts_with('.') || name == "obj" || name == "bin" {
                 continue;
             }
-            walk_cs(root, &path, methods, classes, depth + 1);
+            walk_cs(root, &path, target_path, methods, classes, depth + 1);
         } else if name.ends_with(".cs") {
             let rel = path.parent().unwrap_or(root);
             let rel = rel.strip_prefix(root).unwrap_or(rel);
             let dir_str = rel.to_string_lossy().replace('\\', ".").replace('/', ".");
             let dir_str = dir_str.trim_matches('.').to_string();
-            parse_cs_file(&path, &dir_str, methods, classes);
+            parse_cs_file(&path, &dir_str, target_path, methods, classes);
         }
     }
 }
@@ -369,20 +384,31 @@ fn walk_cs(
 fn parse_cs_file(
     path: &Path,
     dir_str: &str,
-    methods: &mut HashMap<String, Vec<(String, String)>>,
+    target_path: &str,
+    methods: &mut HashMap<String, Vec<SourceMethod>>,
     classes: &mut HashMap<String, String>,
 ) {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return,
     };
-    parse_cs_content(&content, dir_str, methods, classes);
+    parse_cs_content_with_target(&content, dir_str, target_path, methods, classes);
 }
 
 pub(crate) fn parse_cs_content(
     content: &str,
     dir_str: &str,
-    methods: &mut HashMap<String, Vec<(String, String)>>,
+    methods: &mut HashMap<String, Vec<SourceMethod>>,
+    classes: &mut HashMap<String, String>,
+) {
+    parse_cs_content_with_target(content, dir_str, "", methods, classes);
+}
+
+fn parse_cs_content_with_target(
+    content: &str,
+    dir_str: &str,
+    target_path: &str,
+    methods: &mut HashMap<String, Vec<SourceMethod>>,
     classes: &mut HashMap<String, String>,
 ) {
     // UTF-8 BOM (U+FEFF) breaks `namespace` on line 1 — common for VS-saved .cs files.
@@ -434,7 +460,11 @@ pub(crate) fn parse_cs_content(
                     methods
                         .entry(method_name)
                         .or_default()
-                        .push((dir_str.to_string(), qualified));
+                        .push((
+                            dir_str.to_string(),
+                            qualified,
+                            target_path.to_string(),
+                        ));
                 }
             }
             has_test_attr = false;
@@ -609,59 +639,72 @@ fn strip_modifier(s: &str) -> &str {
     s
 }
 
-fn find_test_project_roots(root: &Path, target: Option<&str>) -> Vec<std::path::PathBuf> {
+fn relative_path_from(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn test_project_from_path(root: &Path, project_path: &Path) -> Option<TestProject> {
+    Some(TestProject {
+        root: project_path.parent()?.to_path_buf(),
+        target_path: relative_path_from(root, project_path),
+    })
+}
+
+fn find_test_projects(root: &Path, target: Option<&str>) -> Vec<TestProject> {
     if let Some(target) = target {
         let target_path = root.join(target);
         if is_test_project_file(&target_path) {
-            if let Some(parent) = target_path.parent() {
-                return vec![parent.to_path_buf()];
+            if let Some(project) = test_project_from_path(root, &target_path) {
+                return vec![project];
             }
         }
 
         if is_solution_file(&target_path) {
-            let roots = find_test_project_roots_in_solution(&target_path);
-            if !roots.is_empty() {
-                return roots;
+            let projects = find_test_projects_in_solution(root, &target_path);
+            if !projects.is_empty() {
+                return projects;
             }
         }
     }
 
     let mut results = Vec::new();
     collect_csproj(root, 0, &mut results);
-    let mut test_roots = Vec::new();
+    let mut test_projects = Vec::new();
     for csproj in results {
-        if let Ok(content) = std::fs::read_to_string(&csproj) {
-            let lower = content.to_lowercase();
-            if lower.contains("nunit") || lower.contains("xunit") || lower.contains("mstest") {
-                if let Some(p) = csproj.parent() {
-                    test_roots.push(p.to_path_buf());
-                }
+        if is_test_project_file(&csproj) {
+            if let Some(project) = test_project_from_path(root, &csproj) {
+                test_projects.push(project);
             }
         }
     }
-    test_roots
+    test_projects.sort();
+    test_projects.dedup();
+    test_projects
 }
 
-fn find_test_project_roots_in_solution(solution: &Path) -> Vec<PathBuf> {
+fn find_test_projects_in_solution(root: &Path, solution: &Path) -> Vec<TestProject> {
     let content = match std::fs::read_to_string(solution) {
         Ok(content) => content,
         Err(_) => return Vec::new(),
     };
     let solution_dir = solution.parent().unwrap_or_else(|| Path::new("."));
-    let mut roots = Vec::new();
+    let mut projects = Vec::new();
 
     for rel_project in extract_csproj_references(&content) {
         let project = solution_dir.join(rel_project.replace('\\', std::path::MAIN_SEPARATOR_STR));
         if is_test_project_file(&project) {
-            if let Some(parent) = project.parent() {
-                roots.push(parent.to_path_buf());
+            if let Some(test_project) = test_project_from_path(root, &project) {
+                projects.push(test_project);
             }
         }
     }
 
-    roots.sort();
-    roots.dedup();
-    roots
+    projects.sort();
+    projects.dedup();
+    projects
 }
 
 fn extract_csproj_references(content: &str) -> Vec<String> {
@@ -1089,33 +1132,61 @@ Choose another solution/project target, or clone the missing dependency repos.",
 
 /// Build a `dotnet test` Command with filter and config exclusions applied.
 /// Caller controls Stdio (piped vs inherited).
+fn load_excluded_category_filter() -> Option<String> {
+    let config = Config::new().ok()?;
+    let settings = config.load_settings().ok()?;
+    if settings.excluded_categories.is_empty() {
+        return None;
+    }
+
+    Some(
+        settings
+            .excluded_categories
+            .iter()
+            .map(|c| format!("Category!={}", c))
+            .collect::<Vec<_>>()
+            .join("&"),
+    )
+}
+
 pub fn build_test_command(filter: Option<String>, no_build: bool, no_restore: bool) -> Command {
+    build_test_command_for_target(None, filter, no_build, no_restore)
+}
+
+pub fn compose_test_filter(filter: Option<String>) -> Option<String> {
+    let mut final_filter = filter.filter(|value| !value.is_empty());
+
+    if let Some(exclude_str) = EXCLUDED_CATEGORY_FILTER
+        .get_or_init(load_excluded_category_filter)
+        .clone()
+    {
+        match final_filter {
+            Some(f) => final_filter = Some(format!("({})&({})", f, exclude_str)),
+            None => final_filter = Some(exclude_str),
+        }
+    }
+
+    final_filter
+}
+
+pub fn build_test_command_for_target(
+    target_override: Option<&str>,
+    filter: Option<String>,
+    no_build: bool,
+    no_restore: bool,
+) -> Command {
     let mut cmd = Command::new("dotnet");
     cmd.arg("test")
         .arg("/p:UseSharedCompilation=true")
         .arg(get_base_output_path_arg());
-    if let Ok(Some(target)) = resolve_test_target(true) {
+    let resolved_target = target_override
+        .map(|target| target.to_string())
+        .or_else(|| resolve_test_target(true).ok().flatten());
+    if let Some(target) = resolved_target {
         cmd.arg(target);
     }
 
-    let mut final_filter = filter;
-    if let Ok(config) = Config::new() {
-        if let Ok(settings) = config.load_settings() {
-            if !settings.excluded_categories.is_empty() {
-                let excludes: Vec<String> = settings
-                    .excluded_categories
-                    .iter()
-                    .map(|c| format!("Category!={}", c))
-                    .collect();
-                let exclude_str = excludes.join("&");
-                match final_filter {
-                    Some(f) => final_filter = Some(format!("({})&({})", f, exclude_str)),
-                    None => final_filter = Some(exclude_str),
-                }
-            }
-        }
-    }
-
+    let final_filter = compose_test_filter(filter);
     if let Some(f) = final_filter {
         cmd.arg("--filter");
         cmd.arg(f);

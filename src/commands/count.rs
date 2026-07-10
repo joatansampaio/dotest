@@ -11,7 +11,9 @@ pub fn run(folder: String, no_build: bool) -> Result<()> {
         let s = sum_for_count_query(&tests, &folder);
         let b = tests
             .iter()
-            .filter(|(_, fk, _)| fk == p.as_str() || fk.starts_with(&format!("{}.", p)))
+            .filter(|test| {
+                test.filter_key == p.as_str() || test.filter_key.starts_with(&format!("{}.", p))
+            })
             .count();
         (p, s, b)
     } else {
@@ -25,7 +27,7 @@ pub fn run(folder: String, no_build: bool) -> Result<()> {
         let s = sum_for_count_query(&tests, &folder);
         let b = tests
             .iter()
-            .filter(|(tree, _, _)| tree_under_prefix(tree, &p))
+            .filter(|test| tree_under_prefix(&test.tree_path, &p))
             .count();
         (p, s, b)
     };

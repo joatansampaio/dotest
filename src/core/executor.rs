@@ -1200,7 +1200,7 @@ pub fn build_test_command_for_target(
     cmd
 }
 
-/// Returns the `/p:OutputPath=...` MSBuild argument with a relative path.
+/// Returns the `/p:BaseOutputPath=...` MSBuild argument with a relative path.
 fn get_base_output_path_arg() -> String {
-    "/p:OutputPath=bin/dotest/".to_string()
+    "/p:BaseOutputPath=bin/dotest/".to_string()
 }

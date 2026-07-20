@@ -12,7 +12,7 @@ namespace Dotest.ChurnSidecar;
 
 internal static class Program
 {
-	private const string OutputPathProperty = "-p:OutputPath=bin/dotest/";
+	private const string BaseOutputPathProperty = "-p:BaseOutputPath=bin/dotest/";
 	private const string Divider = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━";
 	private const string EmptyRunSettingsXml = "<RunSettings></RunSettings>";
 
@@ -398,7 +398,7 @@ internal static class Program
 			projectPath,
 			"-nologo",
 			"-getProperty:TargetPath",
-			OutputPathProperty
+			BaseOutputPathProperty
 		);
 
 		var trimmedOutput = output.Trim();
@@ -434,7 +434,7 @@ internal static class Program
 			"-nologo",
 			"-v",
 			"q",
-			OutputPathProperty
+			BaseOutputPathProperty
 		);
 		if (noRestore)
 		{

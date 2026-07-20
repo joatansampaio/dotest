@@ -70,7 +70,7 @@ Installed SDKs:
 
     let message = format_discovery_failure(Some(1), "", stderr, true, true, None);
 
-    assert!(message.contains("Test discovery failed while running `dotnet test /p:UseSharedCompilation=true /p:OutputPath="));
+    assert!(message.contains("Test discovery failed while running `dotnet test /p:UseSharedCompilation=true /p:BaseOutputPath="));
     assert!(message.contains("bin/dotest/"));
     assert!(message.contains("-t --no-build --no-restore`"));
     assert!(

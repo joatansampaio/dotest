@@ -12,6 +12,7 @@ mod layout;
 mod manual_watch;
 mod output;
 mod presets;
+mod run_results;
 mod test_run;
 
 pub fn run() -> Result<()> {

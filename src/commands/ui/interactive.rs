@@ -39,7 +39,7 @@ use ratatui::{
     Terminal,
 };
 
-use super::config::{OutputMode, RunConfig, Verbosity};
+use super::config::{OutputMode, RunConfig, Verbosity, ViewMode};
 use super::filter::{build_filter, build_selected_run_request};
 use super::layout::{
     centered_rect, format_elapsed, output_wrapped_scroll_max, styled_output_lines,
@@ -49,6 +49,7 @@ use super::output::{
     OutputEvent,
 };
 use super::presets::{apply_preset_selection, collect_selected_tests, save_preset};
+use super::run_results::{LeafStatus, RunResultsState};
 
 type DiscoveryEntries = Vec<DiscoveredTest>;
 type RediscoveryResult = std::result::Result<DiscoveryEntries, String>;
@@ -204,7 +205,7 @@ pub(super) fn run_interactive_loop(
 
     let mut show_config = false;
     // 0: skip build, 1: skip restore, 2: verbosity, 3: output,
-    // 4: manual watch, 5: debounce, 6: confirm exit on Esc
+    // 4: view mode, 5: manual watch, 6: debounce, 7: confirm exit on Esc
     let mut config_cursor: usize = 0;
     let mut show_exit_confirm = false;
     let mut show_help = false;
@@ -215,6 +216,12 @@ pub(super) fn run_interactive_loop(
     let mut preset_input_cursor: usize = 0;
     let mut show_presets = false;
     let mut preset_list_cursor: usize = 0;
+
+    let mut run_results = RunResultsState::load();
+    run_results.recompute_rollups(tree);
+    // When true, Results mode hides the leaf output panel until selection changes.
+    let mut results_panel_hidden = false;
+    let mut last_results_focus_fqn: Option<String> = None;
 
     let root_dir = std::env::current_dir()?;
     let mut manual_watch_handle: Option<ManualWatchHandle> = None;
@@ -284,9 +291,21 @@ pub(super) fn run_interactive_loop(
                             }
                         }
 
+                        // Attribute Passed/Failed/Skipped to tree leaves (results mode).
+                        // Skip churn iteration banner lines; still attribute per-test lines.
+                        if parse_churn_iteration_start_line(trimmed).is_none()
+                            && parse_churn_iteration_passed_line(trimmed).is_none()
+                            && parse_churn_iteration_failed_line(trimmed).is_none()
+                        {
+                            run_results.ingest_line(&line, tree);
+                        }
+
                         output_lines.push(line);
                         if is_churning {
                             trim_churn_output_lines(&mut output_lines);
+                        } else {
+                            // Regular runs: keep failed_tests fresh for Ctrl+E mid-run.
+                            failed_tests = extract_failed_tests(&output_lines);
                         }
                     }
                     Ok(OutputEvent::Finished(code)) => {
@@ -511,6 +530,9 @@ pub(super) fn run_interactive_loop(
                                 failed_detail_scroll = 0;
                                 failure_detail_hover = None;
                             }
+                            run_results.finalize_pending(tree);
+                            run_results.save();
+                            results_panel_hidden = false;
                             run_pid = None;
                         }
                     }
@@ -540,6 +562,7 @@ pub(super) fn run_interactive_loop(
                     *tree = new_tree;
                     state.select(Some(0));
                     search_query.clear();
+                    run_results.prune_to_tree(tree);
                     let total: usize = tests.iter().map(|test| test.test_count).sum();
                     output_lines.push(format!(
                         "✓ Found {} tests ({} methods).",
@@ -625,6 +648,8 @@ pub(super) fn run_interactive_loop(
                             &mut failed_detail_scroll,
                             &mut is_running,
                             &mut show_output_fullscreen,
+                            &mut run_results,
+                            &mut results_panel_hidden,
                         );
                     }
                 }
@@ -697,9 +722,52 @@ pub(super) fn run_interactive_loop(
             .map(|n| n.test_count)
             .sum();
 
+        let focused_leaf_fqn: Option<String> = state
+            .selected()
+            .and_then(|di| visible_indices.get(di).copied())
+            .and_then(|ri| {
+                let node = &tree[ri];
+                if node.is_leaf {
+                    node.fqn.clone()
+                } else {
+                    None
+                }
+            });
+        if focused_leaf_fqn != last_results_focus_fqn {
+            last_results_focus_fqn = focused_leaf_fqn.clone();
+            results_panel_hidden = false;
+        }
+
+        let results_leaf_lines: Option<Vec<String>> =
+            if run_config.view_mode == ViewMode::Results {
+                focused_leaf_fqn
+                    .as_deref()
+                    .filter(|fqn| run_results.get(fqn).is_some())
+                    .map(|fqn| run_results.leaf_panel_lines(fqn))
+            } else {
+                None
+            };
+
         let has_output = !output_lines.is_empty();
-        let show_output_panel =
-            has_output && (run_config.output_mode == OutputMode::Split || show_output_fullscreen);
+        let show_output_panel = match run_config.view_mode {
+            ViewMode::LiveOutput => {
+                has_output
+                    && (run_config.output_mode == OutputMode::Split || show_output_fullscreen)
+            }
+            ViewMode::Results => {
+                // Per-leaf details for the focused test (live during the run once that
+                // leaf has an outcome, and after the run finishes).
+                !results_panel_hidden
+                    && results_leaf_lines
+                        .as_ref()
+                        .map(|l| !l.is_empty())
+                        .unwrap_or(false)
+            }
+        };
+        let panel_lines: &[String] = match run_config.view_mode {
+            ViewMode::Results => results_leaf_lines.as_deref().unwrap_or(&[]),
+            ViewMode::LiveOutput => &output_lines,
+        };
         let area = terminal.size()?;
         let split_constraints = if show_output_panel && !show_output_fullscreen {
             Some(split_output_constraints(&mut tests_pane_rows, area.height))
@@ -721,7 +789,7 @@ pub(super) fn run_interactive_loop(
             let output_chunk_idx = if show_output_fullscreen { 0 } else { 1 };
             let inner_w = chunks[output_chunk_idx].width.saturating_sub(2);
             let inner_h = chunks[output_chunk_idx].height.saturating_sub(2);
-            output_wrapped_scroll_max(&output_lines, inner_w, inner_h)
+            output_wrapped_scroll_max(panel_lines, inner_w, inner_h)
         } else {
             0
         };
@@ -768,16 +836,77 @@ pub(super) fn run_interactive_loop(
                 };
                 let indent = "  ".repeat(node.depth);
                 let check = if node.is_selected { "[x] " } else if node.is_partial { "[~] " } else { "[ ] " };
-                let display_str = format!("{}{}{}{}", indent, prefix, check, node.label);
+
+                let count_suffix = if run_config.view_mode == ViewMode::Results {
+                    if node.is_leaf {
+                        match node.fqn.as_deref().and_then(|f| run_results.get(f)) {
+                            Some(r) => match r.status {
+                                LeafStatus::Passed => "  ✓".to_string(),
+                                LeafStatus::Failed => "  ✗".to_string(),
+                                LeafStatus::Skipped => "  ⚠".to_string(),
+                            },
+                            None => String::new(),
+                        }
+                    } else if let Some(counts) = run_results.parent_counts.get(&real_idx) {
+                        counts.format_suffix()
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
+                let display_str =
+                    format!("{}{}{}{}{}", indent, prefix, check, node.label, count_suffix);
 
                 let style = if Some(display_idx) == state.selected() {
-                    Style::default().bg(Color::DarkGray).fg(Color::White).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                } else if run_config.view_mode == ViewMode::Results && !run_results.is_empty() {
+                    if node.is_leaf {
+                        match node.fqn.as_deref().and_then(|f| run_results.get(f)) {
+                            Some(r) => match r.status {
+                                LeafStatus::Passed => Style::default().fg(Color::Green),
+                                LeafStatus::Failed => Style::default().fg(Color::Red),
+                                LeafStatus::Skipped => Style::default().fg(Color::Yellow),
+                            },
+                            None => {
+                                if node.is_selected {
+                                    Style::default().fg(Color::DarkGray)
+                                } else {
+                                    Style::default().fg(Color::DarkGray)
+                                }
+                            }
+                        }
+                    } else if let Some(counts) = run_results.parent_counts.get(&real_idx) {
+                        if counts.failed > 0 {
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                        } else if counts.passed > 0 {
+                            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                        } else if counts.skipped > 0 {
+                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                        } else if node.depth == 0 {
+                            Style::default()
+                                .fg(Color::LightMagenta)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                        }
+                    } else if node.depth == 0 {
+                        Style::default()
+                            .fg(Color::LightMagenta)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    }
                 } else if !node.is_leaf && node.depth == 0 {
                     Style::default().fg(Color::LightMagenta).add_modifier(Modifier::BOLD)
                 } else if !node.is_leaf {
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
                 } else if node.is_selected {
-                    Style::default().fg(Color::Green)
+                    // Soft rose — readable, and distinct from success green / folder magenta.
+                    Style::default().fg(Color::Rgb(210, 155, 180))
                 } else {
                     Style::default().fg(Color::DarkGray)
                 };
@@ -800,9 +929,21 @@ pub(super) fn run_interactive_loop(
             }
 
             if show_output_panel {
-                let output_text = styled_output_lines(&output_lines);
+                let output_text = styled_output_lines(panel_lines);
 
-                let output_title = if is_rediscovering {
+                let output_title = if run_config.view_mode == ViewMode::Results {
+                    let name = focused_leaf_fqn.as_deref().unwrap_or("test");
+                    let status = focused_leaf_fqn
+                        .as_deref()
+                        .and_then(|f| run_results.get(f))
+                        .map(|r| match r.status {
+                            LeafStatus::Passed => "Passed",
+                            LeafStatus::Failed => "Failed",
+                            LeafStatus::Skipped => "Skipped",
+                        })
+                        .unwrap_or("Result");
+                    format!(" Result ({status}) — {name} ")
+                } else if is_rediscovering {
                     let elapsed = rediscovery_start
                         .map(|s| format_elapsed(s.elapsed()))
                         .unwrap_or_default();
@@ -859,51 +1000,66 @@ pub(super) fn run_interactive_loop(
             } else {
                 ""
             };
+            let view_hint = match run_config.view_mode {
+                ViewMode::Results => "  View: Results",
+                ViewMode::LiveOutput => "  View: Live",
+            };
             let help_text = if show_output_fullscreen && is_running {
                 let elapsed = run_start.map(|s| format_elapsed(s.elapsed())).unwrap_or_default();
                 format!(
-                    " Fullscreen output... {}  |  PgUp/PgDn/Home/End/mouse: scroll  Ctrl+E: failed summary  Esc: cancel run{}",
-                    elapsed, watch_hint
+                    " Fullscreen output... {}  |  PgUp/PgDn/Home/End/mouse: scroll  Ctrl+E: failed summary  Esc: cancel run{}{}",
+                    elapsed, watch_hint, view_hint
                 )
             } else if show_output_fullscreen {
                 format!(
-                    " Fullscreen output  |  PgUp/PgDn/Home/End/mouse: scroll  Esc: back to tree{}",
-                    watch_hint
+                    " Fullscreen output  |  PgUp/PgDn/Home/End/mouse: scroll  Esc: back to tree{}{}",
+                    watch_hint, view_hint
                 )
             } else if !search_query.is_empty() {
                 format!(
-                    " Search: {}  |  Esc: clear  Enter: run  ?: help{}",
-                    search_query, watch_hint
+                    " Search: {}  |  Esc: clear  Enter: run  ?: help{}{}",
+                    search_query, watch_hint, view_hint
                 )
             } else if is_running && is_churning {
                 let elapsed = run_start.map(|s| format_elapsed(s.elapsed())).unwrap_or_default();
                 let limit_suffix = churn_limit
                     .map(|limit| format!("/{}", limit))
                     .unwrap_or_else(|| "/∞".to_string());
+                let tree_nav = if run_config.view_mode == ViewMode::Results {
+                    "  ←/→: expand"
+                } else {
+                    ""
+                };
                 format!(
-                    " Churning iteration {}{}... {}  |  Ctrl+E: failed summary  Esc: stop churn{}",
-                    churn_iteration, limit_suffix, elapsed, watch_hint
+                    " Churning iteration {}{}... {}  |  ✓:{} ✗:{} ⚠:{}{}  Ctrl+E: failed summary  Esc: stop{}{}",
+                    churn_iteration, limit_suffix, elapsed, run_passed, run_failed, run_skipped, tree_nav, watch_hint, view_hint
                 )
             } else if is_running {
                 let elapsed = run_start.map(|s| format_elapsed(s.elapsed())).unwrap_or_default();
+                let tree_nav = if run_config.view_mode == ViewMode::Results {
+                    "  ←/→: expand"
+                } else {
+                    ""
+                };
                 format!(
-                    " Running... {}  |  PgUp/PgDn/Home/End: output scroll  Ctrl+E: failed summary  Esc: cancel{}",
-                    elapsed, watch_hint
+                    " Running... {}  |  ✓:{} ✗:{} ⚠:{}{}  Ctrl+E: failed summary  Esc: cancel{}{}",
+                    elapsed, run_passed, run_failed, run_skipped, tree_nav, watch_hint, view_hint
                 )
             } else if is_rediscovering {
                 let elapsed = rediscovery_start
                     .map(|s| format_elapsed(s.elapsed()))
                     .unwrap_or_default();
                 format!(
-                    " Rediscovering tests... {}  |  UI remains responsive{}",
-                    elapsed, watch_hint
+                    " Rediscovering tests... {}  |  UI remains responsive{}{}",
+                    elapsed, watch_hint, view_hint
                 )
             } else {
-                let mut text = " Arrows: nav  Space: toggle  Enter: run  Ctrl+U: churn  Ctrl+Shift+U: churn 100x  PgUp/PgDn/Home/End: output scroll ".to_string();
+                let mut text = " Arrows: nav  Space: toggle  Enter: run  Ctrl+U: churn  Ctrl+V: view  Ctrl+X: clear results ".to_string();
                 if run_config.manual_watch_enabled {
                     text.push_str(watch_hint);
                 }
-                text.push_str("  Ctrl+S: save preset  Ctrl+L: presets  Ctrl+E: failed summary ");
+                text.push_str(view_hint);
+                text.push_str("  Ctrl+S: preset  Ctrl+L: presets  Ctrl+E: failed ");
                 text.push_str(" ?: help  Esc: quit ");
                 text
             };
@@ -919,7 +1075,7 @@ pub(super) fn run_interactive_loop(
             f.render_widget(help, chunks[help_chunk_idx]);
 
             if show_config {
-                let popup = centered_rect(64, 22, area);
+                let popup = centered_rect(78, 28, area);
                 f.render_widget(Clear, popup);
 
                 let v_label = match run_config.verbosity {
@@ -929,13 +1085,20 @@ pub(super) fn run_interactive_loop(
                 };
                 let out_label = match run_config.output_mode {
                     OutputMode::Split => "Split (tree + output)",
-                    OutputMode::Fullscreen => "Fullscreen when running",
+                    OutputMode::Fullscreen => "Fullscreen when running (Live)",
+                };
+                let view_label = match run_config.view_mode {
+                    ViewMode::Results => "Results (tree colors + leaf panel)",
+                    ViewMode::LiveOutput => "Live (streaming output panel)",
                 };
                 let mw = if run_config.manual_watch_enabled { "on " } else { "off" };
                 let d = run_config.manual_watch_delay_ms;
                 let mut config_lines: Vec<Line> = vec![
                     Line::from(""),
-                    Line::from(Span::styled(" Build & output ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+                    Line::from(Span::styled(
+                        " Build & discovery ",
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    )),
                 ];
                 let line_strings = vec![
                     format!(
@@ -947,12 +1110,13 @@ pub(super) fn run_interactive_loop(
                         if run_config.no_restore { "[x]" } else { "[ ]" }
                     ),
                     format!("  [∙]  Log verbosity:  {v_label}  (Space: cycle)"),
-                    format!("  [∙]  Output:  {out_label}  (Space: toggle)"),
+                    format!("  [∙]  Output layout:  {out_label}  (Space: toggle)"),
+                    format!("  [∙]  View mode:  {view_label}  (Space: toggle)"),
                     format!(
-                        "  {}  Manual watch:  {mw} — re-runs only checked tests on `.cs` changes",
+                        "  {}  Manual watch:  {mw} — re-runs only checked tests on `.cs` save",
                         if run_config.manual_watch_enabled { "[x]" } else { "[ ]" }
                     ),
-                    format!("  [∙]  Watch debounce:  {d} ms   ←/→: ±200  (applies to manual watch)"),
+                    format!("  [∙]  Watch debounce:  {d} ms   ←/→: ±200 ms"),
                     format!(
                         "  {}  Confirm exit on Esc",
                         if run_config.confirm_exit_on_esc { "[x]" } else { "[ ]" }
@@ -960,7 +1124,10 @@ pub(super) fn run_interactive_loop(
                 ];
                 for (i, line) in line_strings.iter().enumerate() {
                     let style = if i == config_cursor {
-                        Style::default().bg(Color::DarkGray).fg(Color::White).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .bg(Color::DarkGray)
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(Color::White)
                     };
@@ -968,76 +1135,130 @@ pub(super) fn run_interactive_loop(
                 }
                 config_lines.push(Line::from(""));
                 config_lines.push(Line::from(Span::styled(
-                    "  ↑/↓: move   Space: change row   ←/→: debounce 200 ms (row 5)   Esc / Enter: save & close",
+                    "  Results = tree pass/fail colors + focused-leaf panel (default).",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                config_lines.push(Line::from(Span::styled(
+                    "  Live = classic streaming log. Output layout mainly applies to Live.",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                config_lines.push(Line::from(Span::styled(
+                    "  ↑/↓ move  ·  Space change  ·  ←/→ debounce  ·  Esc / Enter save & close",
                     Style::default().fg(Color::DarkGray),
                 )));
                 config_lines.push(Line::from(""));
 
                 let config_widget = Paragraph::new(config_lines)
-                    .block(Block::default()
-                        .title(" Settings (Ctrl+P) ")
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Cyan)));
+                    .block(
+                        Block::default()
+                            .title(" Settings (Ctrl+P) ")
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::Cyan)),
+                    )
+                    .wrap(Wrap { trim: false });
                 f.render_widget(config_widget, popup);
             }
 
             if show_help {
-                let popup = centered_rect(62, 26, area);
+                let popup = centered_rect(88, 48, area);
                 f.render_widget(Clear, popup);
 
                 let help_lines = vec![
-                    Line::from(Span::styled(" Navigation", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
-                    Line::from("  ↑/↓       : Move selection in the test tree"),
-                    Line::from("  ←/→       : Collapse / expand folders"),
-                    Line::from("  a-z/0-9   : Type to filter (search) the tree"),
-                    Line::from("  Backspace : Delete last search character"),
-                    Line::from("  Esc       : Clear search, or quit if search is empty"),
+                    Line::from(Span::styled(
+                        " Navigation",
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from("  ↑/↓         : Move selection in the test tree"),
+                    Line::from("  ←/→         : Collapse / expand folders and classes"),
+                    Line::from("  a-z / 0-9   : Type to search/filter the tree"),
+                    Line::from("  Backspace   : Delete last search character"),
+                    Line::from("  Esc         : Clear search, hide leaf result panel, or quit"),
                     Line::from(""),
-                    Line::from(Span::styled(" Running & output", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
-                    Line::from("  Enter     : Run all checked tests"),
-                    Line::from("  Ctrl+U    : Churn checked tests until failure (or until manually stopped)"),
-                    Line::from("  Ctrl+Shift+U : Quick churn with max 100 iterations"),
-                    Line::from("  Esc       : Cancel a run in progress, or leave fullscreen output"),
-                    Line::from("  PgUp/Dn, Home, End : Scroll the output pane (when visible)"),
-                    Line::from("  Mouse wheel : Scroll output when the output panel is focused"),
-                    Line::from("  Ctrl+I/O : Move the Tests/Output split up/down one row"),
-                    Line::from("  Output title shows [follow] (tail) vs [scroll] (manual)"),
+                    Line::from(Span::styled(
+                        " Running tests",
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from("  Space       : Check / uncheck a test or folder"),
+                    Line::from("  Ctrl+A      : Toggle all visible tests"),
+                    Line::from("  Enter       : Run all checked tests"),
+                    Line::from("  Ctrl+U      : Churn checked tests until failure (Esc to stop)"),
+                    Line::from("  Ctrl+Shift+U: Quick churn (max 100 iterations)"),
+                    Line::from("  Esc         : Cancel a run, or leave fullscreen Live output"),
                     Line::from(""),
-                    Line::from(Span::styled(" Toggles & shortcuts", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
-                    Line::from("  Space     : Toggle checkmark on test or folder branch"),
-                    Line::from("  Ctrl+A    : Toggle all visible tests (select all or clear all)"),
-                    Line::from("  Ctrl+W    : Toggle manual watch on/off (saved). ● WATCH ON in status when active"),
-                    Line::from("  Ctrl+P    : Settings (verbosity, output mode, watch debounce, …)"),
-                    Line::from("  Ctrl+S    : Save selected tests as a reusable preset (name required, optional tag)"),
-                    Line::from("  Ctrl+L    : Open presets and run one preset in a single action"),
-                    Line::from("  Ctrl+E    : Failed tests summary (opens immediately and fills as failures arrive)"),
+                    Line::from(Span::styled(
+                        " View modes (Ctrl+V to toggle)",
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from("  Results     : Default. Tree shows pass (green) / fail (red) / skip (yellow)."),
+                    Line::from("                Checked leaves use a soft rose until they finish."),
+                    Line::from("                Focus a leaf to open its result panel (also mid-run once done)."),
+                    Line::from("                While running: ↑/↓/←/→ still navigate and expand the tree."),
+                    Line::from("  Live        : Classic streaming output panel while tests run."),
+                    Line::from("  Ctrl+X      : Clear last-run colors, leaf panel, and bin/dotest/last_run.json"),
                     Line::from(""),
-                    Line::from(Span::styled(" Tool & discovery", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
-                    Line::from("  F1 / ?    : Open this help"),
-                    Line::from("  F5        : Rediscover tests and refresh the tree (updates the on-disk list)"),
-                    Line::from("  Startup   : Skips discovery when `.dotest_cache.json` matches repo/file fingerprint"),
+                    Line::from(Span::styled(
+                        " Output pane",
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from("  PgUp/PgDn, Home, End, mouse wheel : Scroll when the output panel is visible"),
+                    Line::from("  Ctrl+I / Ctrl+O : Move the Tests/Output split up or down (split layout)"),
+                    Line::from("  Title shows [follow] (tail) vs [scroll] (manual)"),
+                    Line::from("  Click a leaf    : Focus it (Results shows that test's output)"),
                     Line::from(""),
-                    Line::from(Span::styled(" Manual watch", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+                    Line::from(Span::styled(
+                        " Shortcuts",
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from("  Ctrl+P      : Settings (build, verbosity, view mode, watch, …)"),
+                    Line::from("  Ctrl+W      : Toggle manual watch (● WATCH ON in the status bar)"),
+                    Line::from("  Ctrl+S      : Save checked tests as a preset"),
+                    Line::from("  Ctrl+L      : Open presets and run one"),
+                    Line::from("  Ctrl+E      : Failed-tests summary (fills as failures arrive)"),
+                    Line::from("  F5          : Rediscover tests and refresh the tree/cache"),
+                    Line::from("  F1 / ?      : Open this help"),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        " Persistence",
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from("  Settings    : Saved in `.dotest.yml`"),
+                    Line::from("  Discovery   : Cached in `.dotest_cache.json` (skipped when fingerprint matches)"),
+                    Line::from("  Last run    : Results colors persist in `bin/dotest/last_run.json`"),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        " Manual watch",
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    )),
                     Line::from("  When ON, saving a `.cs` file re-runs only the tests you have checked."),
-                    Line::from("  Debounce delay is adjusted in Settings (Ctrl+P)."),
+                    Line::from("  Debounce delay is set in Settings (Ctrl+P)."),
                     Line::from(""),
-                    Line::from(Span::styled(" Failed summary (Ctrl+E)", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
-                    Line::from("  Shift+↑/↓: Select failed test  |  ↑/↓/PgUp/Dn: Scroll error details (not the list)"),
-                    Line::from("  r: Re-run one  |  R: Re-run all  |  c/d: copy  |  click list: pick  |  Esc: close"),
+                    Line::from(Span::styled(
+                        " Failed summary (Ctrl+E)",
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from("  Shift+↑/↓   : Select failed test  |  ↑/↓/PgUp/Dn: Scroll error details"),
+                    Line::from("  r / R       : Re-run one / all  |  c/d: copy  |  click list: pick  |  Esc: close"),
+                    Line::from("  ?           : Shortcuts for this overlay"),
                     Line::from(""),
-                    Line::from(Span::styled("  Esc or Enter closes this help window.", Style::default().fg(Color::DarkGray))),
+                    Line::from(Span::styled(
+                        "  Esc or Enter closes this help.",
+                        Style::default().fg(Color::DarkGray),
+                    )),
                 ];
 
                 let help_widget = Paragraph::new(help_lines)
-                    .block(Block::default()
-                        .title(" Help Actions Mode ")
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Yellow)));
+                    .block(
+                        Block::default()
+                            .title(" Help (? / F1) ")
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::Yellow)),
+                    )
+                    .wrap(Wrap { trim: false });
                 f.render_widget(help_widget, popup);
             }
 
             if show_save_preset {
-                let popup = centered_rect(70, 11, area);
+                let popup = centered_rect(76, 13, area);
                 f.render_widget(Clear, popup);
                 let name_style = if preset_input_cursor == 0 {
                     Style::default()
@@ -1081,7 +1302,7 @@ pub(super) fn run_interactive_loop(
             }
 
             if show_presets {
-                let popup = centered_rect(76, 20, area);
+                let popup = centered_rect(82, 24, area);
                 f.render_widget(Clear, popup);
                 let mut items: Vec<ListItem> = Vec::new();
                 for (idx, preset) in run_config.presets.iter().enumerate() {
@@ -1217,7 +1438,7 @@ pub(super) fn run_interactive_loop(
                 f.render_widget(footer, inner[1]);
 
                 if show_failure_summary_help {
-                    let help_popup = centered_rect(62, 36, area);
+                    let help_popup = centered_rect(72, 24, area);
                     f.render_widget(Clear, help_popup);
                     let help_lines = vec![
                         Line::from(Span::styled(
@@ -1242,7 +1463,7 @@ pub(super) fn run_interactive_loop(
                             " Mouse",
                             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                         )),
-                        Line::from("  Click test list      : Select failed test"),
+                        Line::from("  Click test list       : Select failed test"),
                         Line::from("  Click stack-trace link: Open file in editor"),
                         Line::from("  Wheel / drag in details: Scroll details"),
                         Line::from(""),
@@ -1251,7 +1472,7 @@ pub(super) fn run_interactive_loop(
                             Style::default().fg(Color::DarkGray),
                         )),
                         Line::from(Span::styled(
-                            "  Esc also closes the Failed Tests Summary.",
+                            "  Esc from the summary closes Failed Tests Summary.",
                             Style::default().fg(Color::DarkGray),
                         )),
                     ];
@@ -1259,7 +1480,7 @@ pub(super) fn run_interactive_loop(
                     let help_widget = Paragraph::new(help_lines)
                         .block(
                             Block::default()
-                                .title(" Failed Summary Shortcuts ")
+                                .title(" Failed Summary Shortcuts (?) ")
                                 .borders(Borders::ALL)
                                 .border_style(Style::default().fg(Color::Yellow)),
                         )
@@ -1269,7 +1490,7 @@ pub(super) fn run_interactive_loop(
             }
 
             if show_exit_confirm {
-                let popup = centered_rect(52, 9, area);
+                let popup = centered_rect(56, 11, area);
                 f.render_widget(Clear, popup);
                 let confirm_lines = vec![
                     Line::from(""),
@@ -1423,6 +1644,50 @@ pub(super) fn run_interactive_loop(
                             _ => {}
                         }
                         continue;
+                    }
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                        && !show_output_fullscreen
+                        && !show_config
+                        && !show_help
+                        && !show_presets
+                        && !show_save_preset
+                        && !show_exit_confirm
+                    {
+                        let tree_constraints = if show_output_panel {
+                            split_constraints.clone().unwrap_or_else(|| {
+                                split_output_constraints(&mut tests_pane_rows, area.height)
+                            })
+                        } else {
+                            vec![
+                                Constraint::Min(0),
+                                Constraint::Length(0),
+                                Constraint::Length(STATUS_PANE_ROWS),
+                            ]
+                        };
+                        let tree_chunks = Layout::default()
+                            .direction(Direction::Vertical)
+                            .constraints(tree_constraints)
+                            .split(area);
+                        let tree_rect = tree_chunks[0];
+                        let list_inner_x = tree_rect.x.saturating_add(1);
+                        let list_inner_y = tree_rect.y.saturating_add(1);
+                        let list_inner_width = tree_rect.width.saturating_sub(2);
+                        let list_inner_height = tree_rect.height.saturating_sub(2);
+                        let in_tree = list_inner_width > 0
+                            && list_inner_height > 0
+                            && mouse.column >= list_inner_x
+                            && mouse.column < list_inner_x.saturating_add(list_inner_width)
+                            && mouse.row >= list_inner_y
+                            && mouse.row < list_inner_y.saturating_add(list_inner_height);
+                        if in_tree {
+                            let rel = mouse.row.saturating_sub(list_inner_y) as usize;
+                            let offset = state.offset();
+                            let display_idx = offset.saturating_add(rel);
+                            if display_idx < visible_indices.len() {
+                                state.select(Some(display_idx));
+                                results_panel_hidden = false;
+                            }
+                        }
                     }
                     if show_output_panel {
                         match mouse.kind {
@@ -1579,6 +1844,8 @@ pub(super) fn run_interactive_loop(
                                             &mut failed_detail_scroll,
                                             &mut is_running,
                                             &mut show_output_fullscreen,
+                                            &mut run_results,
+                                            &mut results_panel_hidden,
                                         );
                                     }
                                     show_presets = false;
@@ -1763,6 +2030,8 @@ pub(super) fn run_interactive_loop(
                                         &mut failed_detail_scroll,
                                         &mut is_running,
                                         &mut show_output_fullscreen,
+                                        &mut run_results,
+                                        &mut results_panel_hidden,
                                     );
                                 }
                             }
@@ -1794,6 +2063,8 @@ pub(super) fn run_interactive_loop(
                                         &mut failed_detail_scroll,
                                         &mut is_running,
                                         &mut show_output_fullscreen,
+                                        &mut run_results,
+                                        &mut results_panel_hidden,
                                     );
                                 }
                             }
@@ -1822,19 +2093,19 @@ pub(super) fn run_interactive_loop(
                                 }
                             }
                             KeyCode::Down => {
-                                if config_cursor < 6 {
+                                if config_cursor < 7 {
                                     config_cursor += 1;
                                 }
                             }
                             KeyCode::Left => {
-                                if config_cursor == 5 {
+                                if config_cursor == 6 {
                                     run_config.manual_watch_delay_ms = debounce_clamp(
                                         run_config.manual_watch_delay_ms.saturating_sub(200),
                                     );
                                 }
                             }
                             KeyCode::Right => {
-                                if config_cursor == 5 {
+                                if config_cursor == 6 {
                                     run_config.manual_watch_delay_ms = debounce_clamp(
                                         (run_config.manual_watch_delay_ms + 200).min(20_000),
                                     );
@@ -1859,6 +2130,16 @@ pub(super) fn run_interactive_loop(
                                         };
                                 }
                                 4 => {
+                                    run_config.view_mode = match run_config.view_mode {
+                                        ViewMode::Results => ViewMode::LiveOutput,
+                                        ViewMode::LiveOutput => ViewMode::Results,
+                                    };
+                                    results_panel_hidden = false;
+                                    if run_config.view_mode == ViewMode::Results {
+                                        show_output_fullscreen = false;
+                                    }
+                                }
+                                5 => {
                                     run_config.manual_watch_enabled =
                                         !run_config.manual_watch_enabled;
                                     run_config.manual_watch_delay_ms =
@@ -1869,8 +2150,8 @@ pub(super) fn run_interactive_loop(
                                         &mut manual_watch_handle,
                                     );
                                 }
-                                5 => {}
-                                6 => {
+                                6 => {}
+                                7 => {
                                     run_config.confirm_exit_on_esc =
                                         !run_config.confirm_exit_on_esc;
                                 }
@@ -1910,7 +2191,66 @@ pub(super) fn run_interactive_loop(
                     }
 
                     if is_running {
+                        // Results mode keeps the tree as the main surface while tests run.
+                        // Allow expand/collapse and selection movement so users can follow
+                        // live pass/fail colors without waiting for the run to finish.
+                        let allow_tree_nav = run_config.view_mode == ViewMode::Results
+                            && !show_output_fullscreen;
                         match key.code {
+                            KeyCode::Char('x' | 'X') | KeyCode::Char('\u{18}')
+                                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                run_results.clear();
+                                RunResultsState::delete_file();
+                                results_panel_hidden = true;
+                                failed_tests.clear();
+                                show_failure_summary = false;
+                            }
+                            KeyCode::Up if allow_tree_nav => {
+                                if !visible_indices.is_empty() {
+                                    let i = match state.selected() {
+                                        Some(0) | None => visible_indices.len() - 1,
+                                        Some(i) => i - 1,
+                                    };
+                                    state.select(Some(i));
+                                }
+                            }
+                            KeyCode::Down if allow_tree_nav => {
+                                if !visible_indices.is_empty() {
+                                    let i = match state.selected() {
+                                        Some(i) if i >= visible_indices.len() - 1 => 0,
+                                        Some(i) => i + 1,
+                                        None => 0,
+                                    };
+                                    state.select(Some(i));
+                                }
+                            }
+                            KeyCode::Left if allow_tree_nav => {
+                                if let Some(di) = state.selected() {
+                                    if di < visible_indices.len() {
+                                        let ri = visible_indices[di];
+                                        if !tree[ri].is_leaf && tree[ri].is_expanded {
+                                            tree[ri].is_expanded = false;
+                                        } else if let Some(pi) = tree[ri].parent_idx {
+                                            if let Some(pdi) =
+                                                visible_indices.iter().position(|&r| r == pi)
+                                            {
+                                                state.select(Some(pdi));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Right if allow_tree_nav => {
+                                if let Some(di) = state.selected() {
+                                    if di < visible_indices.len() {
+                                        let ri = visible_indices[di];
+                                        if !tree[ri].is_leaf && !tree[ri].is_expanded {
+                                            tree[ri].is_expanded = true;
+                                        }
+                                    }
+                                }
+                            }
                             KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 show_failure_summary = true;
                                 if failed_tests.is_empty() {
@@ -2031,6 +2371,37 @@ pub(super) fn run_interactive_loop(
                     }
 
                     if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && matches!(key.code, KeyCode::Char('v' | 'V'))
+                    {
+                        run_config.view_mode = match run_config.view_mode {
+                            ViewMode::Results => ViewMode::LiveOutput,
+                            ViewMode::LiveOutput => ViewMode::Results,
+                        };
+                        results_panel_hidden = false;
+                        if run_config.view_mode == ViewMode::Results {
+                            show_output_fullscreen = false;
+                        }
+                        run_config.save();
+                        continue;
+                    }
+
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && matches!(
+                            key.code,
+                            // Ctrl+X (and Ctrl+Shift+X when the terminal delivers it).
+                            // Avoid requiring Shift: VS Code/Cursor steals Ctrl+Shift+X for Extensions.
+                            KeyCode::Char('x' | 'X') | KeyCode::Char('\u{18}')
+                        )
+                    {
+                        run_results.clear();
+                        RunResultsState::delete_file();
+                        results_panel_hidden = true;
+                        failed_tests.clear();
+                        show_failure_summary = false;
+                        continue;
+                    }
+
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
                         && matches!(key.code, KeyCode::Char('u' | 'U'))
                     {
                         if let Some(run_request) = build_selected_run_request(tree) {
@@ -2069,6 +2440,8 @@ pub(super) fn run_interactive_loop(
                             churn_using_sidecar = target_path.is_some();
                             churn_successes_before_failure = 0;
                             churn_durations.clear();
+                            run_results.clear();
+                            results_panel_hidden = false;
 
                             let heading = format!(
                                 "━━━ Churning {sel_count} selected test(s) until failure… ━━━"
@@ -2123,7 +2496,8 @@ pub(super) fn run_interactive_loop(
                                     run_skipped = 0;
                                     is_running = true;
                                     show_output_fullscreen =
-                                        run_config.output_mode == OutputMode::Fullscreen;
+                                        run_config.view_mode == ViewMode::LiveOutput
+                                            && run_config.output_mode == OutputMode::Fullscreen;
                                 }
                                 Err(e) => {
                                     is_churning = false;
@@ -2231,7 +2605,8 @@ pub(super) fn run_interactive_loop(
                         );
                         output_scroll = 0;
                         output_follow_tail = true;
-                        show_output_fullscreen = run_config.output_mode == OutputMode::Fullscreen;
+                        show_output_fullscreen = run_config.view_mode == ViewMode::LiveOutput
+                            && run_config.output_mode == OutputMode::Fullscreen;
                         is_rediscovering = true;
                         rediscovery_start = Some(Instant::now());
                         rediscovery_sel = Some(TreeState::capture(tree));
@@ -2286,6 +2661,11 @@ pub(super) fn run_interactive_loop(
                             if !search_query.is_empty() {
                                 search_query.clear();
                                 state.select(Some(0));
+                            } else if run_config.view_mode == ViewMode::Results
+                                && show_output_panel
+                                && !results_panel_hidden
+                            {
+                                results_panel_hidden = true;
                             } else {
                                 if run_config.confirm_exit_on_esc {
                                     show_exit_confirm = true;
@@ -2325,6 +2705,8 @@ pub(super) fn run_interactive_loop(
                                     &mut failed_detail_scroll,
                                     &mut is_running,
                                     &mut show_output_fullscreen,
+                                    &mut run_results,
+                                    &mut results_panel_hidden,
                                 );
                             }
                         }

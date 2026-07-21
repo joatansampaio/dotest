@@ -13,6 +13,16 @@ pub(crate) enum OutputMode {
     Fullscreen,
 }
 
+/// How run results are shown in the TUI.
+///
+/// - [`ViewMode::Results`]: tree colors + pass/fail counts; output only for the focused leaf.
+/// - [`ViewMode::LiveOutput`]: classic streaming output panel (previous default behavior).
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
+pub(crate) enum ViewMode {
+    Results,
+    LiveOutput,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct TestPreset {
     pub name: String,
@@ -24,6 +34,10 @@ pub(crate) struct TestPreset {
 
 fn default_output_mode() -> OutputMode {
     OutputMode::Split
+}
+
+fn default_view_mode() -> ViewMode {
+    ViewMode::Results
 }
 
 fn default_manual_watch_delay_ms() -> u32 {
@@ -51,6 +65,9 @@ pub(crate) struct RunConfig {
     cache_tests: bool,
     #[serde(default = "default_output_mode")]
     pub output_mode: OutputMode,
+    /// Results tree (default) vs classic live output panel.
+    #[serde(default = "default_view_mode")]
+    pub view_mode: ViewMode,
     /// Remembered height of the Tests pane when Output is shown in split mode.
     #[serde(default)]
     pub tests_pane_rows: Option<u16>,
@@ -80,6 +97,7 @@ impl Default for RunConfig {
             verbosity: Verbosity::Normal,
             cache_tests: false,
             output_mode: OutputMode::Split,
+            view_mode: ViewMode::Results,
             tests_pane_rows: None,
             failed_summary_list_pane_cols: None,
             manual_watch_enabled: false,

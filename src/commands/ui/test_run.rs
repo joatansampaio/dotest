@@ -3,9 +3,10 @@
 use std::sync::mpsc;
 use std::time::Instant;
 
-use super::config::{OutputMode, RunConfig};
+use super::config::{OutputMode, RunConfig, ViewMode};
 use super::failed_tests::FailedTestInfo;
 use super::output::{spawn_test_run, OutputEvent};
+use super::run_results::RunResultsState;
 
 /// Shared by Enter, manual watch, and failed-test reruns. `filter` is the
 /// `FullyQualifiedName~…` string from `build_filter` (empty = run all).
@@ -29,8 +30,13 @@ pub(crate) fn launch_filtered_test_run(
     failed_detail_scroll: &mut u16,
     is_running: &mut bool,
     show_output_fullscreen: &mut bool,
+    run_results: &mut RunResultsState,
+    results_panel_hidden: &mut bool,
 ) {
-    *show_output_fullscreen = run_config.output_mode == OutputMode::Fullscreen;
+    // Live Output still wants fullscreen when configured; Results mode never auto-opens
+    // the global stream panel.
+    *show_output_fullscreen = run_config.view_mode == ViewMode::LiveOutput
+        && run_config.output_mode == OutputMode::Fullscreen;
     output_lines.clear();
     *output_scroll = 0;
     *output_follow_tail = true;
@@ -52,6 +58,9 @@ pub(crate) fn launch_filtered_test_run(
             *show_failure_summary = false;
             *failed_selection = 0;
             *failed_detail_scroll = 0;
+            // Clear stale colors; refill as lines arrive.
+            run_results.clear();
+            *results_panel_hidden = false;
         }
         Err(e) => {
             output_lines.push(format!("Error: {e}"));

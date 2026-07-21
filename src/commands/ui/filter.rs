@@ -111,14 +111,14 @@ pub(super) fn build_selected_run_request(tree: &[TreeNode]) -> Option<SelectedRu
 
 #[cfg(test)]
 mod tests {
-    use super::build_selected_run_request;
+    use super::{build_filter, build_selected_run_request};
     use crate::core::tree::TreeNode;
 
-    fn leaf(fqn: &str, target_path: Option<&str>) -> TreeNode {
+    fn leaf(fqn: &str, target_path: Option<&str>, selected: bool) -> TreeNode {
         TreeNode {
             label: fqn.rsplit('.').next().unwrap_or(fqn).to_string(),
             fqn: Some(fqn.to_string()),
-            is_selected: true,
+            is_selected: selected,
             is_partial: false,
             is_expanded: true,
             depth: 0,
@@ -135,10 +135,12 @@ mod tests {
             leaf(
                 "AppCore.Tests.WidgetTests.Renders",
                 Some("smoke/root-app-tests/tests/AppCore.Tests/AppCore.Tests.csproj"),
+                true,
             ),
             leaf(
                 "AppCore.Tests.WidgetTests.Updates",
                 Some("smoke/root-app-tests/tests/AppCore.Tests/AppCore.Tests.csproj"),
+                true,
             ),
         ];
 
@@ -168,10 +170,12 @@ mod tests {
             leaf(
                 "MultiTestsA.UnitTest1.Test1",
                 Some("smoke/multi/MultiTestsA/MultiTestsA.csproj"),
+                true,
             ),
             leaf(
                 "MultiTestsB.UnitTest1.Test1",
                 Some("smoke/multi/MultiTestsB/MultiTestsB.csproj"),
+                true,
             ),
         ];
 
@@ -189,6 +193,32 @@ mod tests {
                 "MultiTestsA.UnitTest1.Test1".to_string(),
                 "MultiTestsB.UnitTest1.Test1".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn build_filter_keeps_both_homonyms_runnable_when_both_selected() {
+        let groups =
+            "Tmly.Test.Groups.GroupQueryHandlerTest.CanLimitScopeUnderTmlyGroupId";
+        let placements =
+            "Tmly.Test.Placements.PlacementQueryHandlerTests.CanLimitScopeUnderTmlyGroupId";
+        let other = "Tmly.Test.Other.SomeTest.DoesSomethingElse";
+        let tree = vec![
+            leaf(groups, None, true),
+            leaf(placements, None, true),
+            leaf(other, None, false),
+        ];
+
+        let filter = build_filter(&tree).expect("filter");
+        // May use include OR of the two FQNs, or a shorter exclude of the unselected leaf.
+        // Either form must still allow both selected homonyms to execute.
+        let excludes_other_only =
+            filter.contains(&format!("FullyQualifiedName!~{other}")) && !filter.contains('|');
+        let includes_both = filter.contains(&format!("FullyQualifiedName~{groups}"))
+            && filter.contains(&format!("FullyQualifiedName~{placements}"));
+        assert!(
+            excludes_other_only || includes_both,
+            "unexpected filter for two selected homonyms: {filter}"
         );
     }
 }

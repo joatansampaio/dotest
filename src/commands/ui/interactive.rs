@@ -748,6 +748,14 @@ pub(super) fn run_interactive_loop(
                 None
             };
 
+        // A build failure reports no test results at all, so Results mode has no leaf to
+        // color or show. Fall back to the raw output so the compiler error stays visible.
+        // `output_lines` is cleared on every launch, so this self-clears on the next run.
+        let build_failed = run_passed + run_failed + run_skipped == 0
+            && output_lines.iter().any(|l| {
+                l.contains(": error CS") || l.contains(": error MSB") || l.contains(": error NETSDK")
+            });
+
         let has_output = !output_lines.is_empty();
         let show_output_panel = match run_config.view_mode {
             ViewMode::LiveOutput => {
@@ -758,13 +766,15 @@ pub(super) fn run_interactive_loop(
                 // Per-leaf details for the focused test (live during the run once that
                 // leaf has an outcome, and after the run finishes).
                 !results_panel_hidden
-                    && results_leaf_lines
-                        .as_ref()
-                        .map(|l| !l.is_empty())
-                        .unwrap_or(false)
+                    && (build_failed
+                        || results_leaf_lines
+                            .as_ref()
+                            .map(|l| !l.is_empty())
+                            .unwrap_or(false))
             }
         };
         let panel_lines: &[String] = match run_config.view_mode {
+            ViewMode::Results if build_failed => &output_lines,
             ViewMode::Results => results_leaf_lines.as_deref().unwrap_or(&[]),
             ViewMode::LiveOutput => &output_lines,
         };
@@ -931,7 +941,9 @@ pub(super) fn run_interactive_loop(
             if show_output_panel {
                 let output_text = styled_output_lines(panel_lines);
 
-                let output_title = if run_config.view_mode == ViewMode::Results {
+                let output_title = if run_config.view_mode == ViewMode::Results && build_failed {
+                    " ✗ Build failed — no tests ran ".to_string()
+                } else if run_config.view_mode == ViewMode::Results {
                     let name = focused_leaf_fqn.as_deref().unwrap_or("test");
                     let status = focused_leaf_fqn
                         .as_deref()
@@ -985,7 +997,9 @@ pub(super) fn run_interactive_loop(
                     .block(Block::default()
                         .title(output_title)
                         .borders(Borders::ALL)
-                        .border_style(if is_running || is_rediscovering {
+                        .border_style(if build_failed {
+                            Style::default().fg(Color::Red)
+                        } else if is_running || is_rediscovering {
                             Style::default().fg(Color::Yellow)
                         } else {
                             Style::default().fg(Color::DarkGray)

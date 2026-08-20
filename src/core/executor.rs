@@ -5,6 +5,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
+use std::time::Instant;
+
+fn discovery_log(msg: impl AsRef<str>) {
+    eprintln!("[discovery] {}", msg.as_ref());
+}
 
 /// Marker substring Cursor injects into `NUGET_PACKAGES` inside agent sandboxes.
 const CURSOR_SANDBOX_NUGET_MARKER: &str = "cursor-sandbox-cache";
@@ -45,18 +50,49 @@ struct TestProject {
 /// `filter_key` is a VSTest-friendly substring for `FullyQualifiedName~` (typically `Namespace.Class.Method`).
 /// `test_count` is the number of `dotnet test -t` lines for that logical test method.
 pub fn discover_tests(no_build: bool, no_restore: bool) -> Result<Vec<DiscoveredTest>> {
+    let total = Instant::now();
+    discovery_log(format!(
+        "start (no_build={no_build}, no_restore={no_restore})"
+    ));
+
+    let stage = Instant::now();
     let target = resolve_test_target(false)?;
+    discovery_log(format!(
+        "resolve_test_target: {:.2}s → {}",
+        stage.elapsed().as_secs_f64(),
+        target.as_deref().unwrap_or("(none)")
+    ));
+
+    let stage = Instant::now();
     let display_names = discover_display_names(target.as_deref(), no_build, no_restore)?;
+    discovery_log(format!(
+        "dotnet test -t: {:.2}s → {} display name(s)",
+        stage.elapsed().as_secs_f64(),
+        display_names.len()
+    ));
     if display_names.is_empty() {
+        discovery_log(format!(
+            "done in {:.2}s (no tests)",
+            total.elapsed().as_secs_f64()
+        ));
         return Ok(Vec::new());
     }
 
+    let stage = Instant::now();
     let test_projects = find_test_projects(Path::new("."), target.as_deref());
+    discovery_log(format!(
+        "find_test_projects: {:.2}s → {} project(s)",
+        stage.elapsed().as_secs_f64(),
+        test_projects.len()
+    ));
 
+    let stage = Instant::now();
     let mut method_map: HashMap<String, Vec<SourceMethod>> = HashMap::new();
     let mut class_map = HashMap::new();
+    let mut cs_files = 0usize;
     for project in &test_projects {
-        let (m, c) = scan_source_maps(&project.root, &project.target_path);
+        let (m, c, files) = scan_source_maps(&project.root, &project.target_path);
+        cs_files += files;
         for (k, mut v) in m {
             method_map.entry(k).or_default().append(&mut v);
         }
@@ -65,12 +101,26 @@ pub fn discover_tests(no_build: bool, no_restore: bool) -> Result<Vec<Discovered
     for v in method_map.values_mut() {
         v.sort_by(|a, b| a.1.cmp(&b.1));
     }
+    discovery_log(format!(
+        "scan_source_maps: {:.2}s → {} .cs file(s), {} method name(s), {} class(es)",
+        stage.elapsed().as_secs_f64(),
+        cs_files,
+        method_map.len(),
+        class_map.len()
+    ));
 
-    Ok(build_discovery_entries(
-        &display_names,
-        &method_map,
-        &class_map,
-    ))
+    let stage = Instant::now();
+    let entries = build_discovery_entries(&display_names, &method_map, &class_map);
+    discovery_log(format!(
+        "build_discovery_entries: {:.2}s → {} discovered test(s)",
+        stage.elapsed().as_secs_f64(),
+        entries.len()
+    ));
+    discovery_log(format!(
+        "done in {:.2}s total",
+        total.elapsed().as_secs_f64()
+    ));
+    Ok(entries)
 }
 
 /// Maps each `dotnet test -t` line to a source method, merges counts, and builds vstest filter keys.
@@ -356,7 +406,7 @@ pub(crate) fn enrich(
     }
 }
 
-/// Returns (method_map, class_map):
+/// Returns (method_map, class_map, cs_file_count):
 ///   method_map: short_method_name -> [(relative_folder, qualified_class_name), ...]
 ///   class_map:  simple class_name  -> relative_folder
 fn scan_source_maps(
@@ -365,11 +415,21 @@ fn scan_source_maps(
 ) -> (
     HashMap<String, Vec<SourceMethod>>,
     HashMap<String, String>,
+    usize,
 ) {
     let mut method_map: HashMap<String, Vec<SourceMethod>> = HashMap::new();
     let mut class_map: HashMap<String, String> = HashMap::new();
-    walk_cs(root, root, target_path, &mut method_map, &mut class_map, 0);
-    (method_map, class_map)
+    let mut cs_files = 0usize;
+    walk_cs(
+        root,
+        root,
+        target_path,
+        &mut method_map,
+        &mut class_map,
+        &mut cs_files,
+        0,
+    );
+    (method_map, class_map, cs_files)
 }
 
 fn walk_cs(
@@ -378,6 +438,7 @@ fn walk_cs(
     target_path: &str,
     methods: &mut HashMap<String, Vec<SourceMethod>>,
     classes: &mut HashMap<String, String>,
+    cs_files: &mut usize,
     depth: usize,
 ) {
     if depth > 10 {
@@ -394,8 +455,17 @@ fn walk_cs(
             if name.starts_with('.') || name == "obj" || name == "bin" {
                 continue;
             }
-            walk_cs(root, &path, target_path, methods, classes, depth + 1);
+            walk_cs(
+                root,
+                &path,
+                target_path,
+                methods,
+                classes,
+                cs_files,
+                depth + 1,
+            );
         } else if name.ends_with(".cs") {
+            *cs_files += 1;
             let rel = path.parent().unwrap_or(root);
             let rel = rel.strip_prefix(root).unwrap_or(rel);
             let dir_str = rel.to_string_lossy().replace('\\', ".").replace('/', ".");
@@ -1016,6 +1086,9 @@ fn discover_display_names(
     cmd.arg("test")
         .arg("/p:UseSharedCompilation=true")
         .arg(get_base_output_path_arg())
+        // Quiet console I/O — discovery only needs the test list lines.
+        .arg("--verbosity")
+        .arg("quiet")
         .arg("-t");
     if let Some(target) = target {
         cmd.arg(target);
@@ -1026,7 +1099,34 @@ fn discover_display_names(
     if no_restore {
         cmd.arg("--no-restore");
     }
+
+    let mut cmdline = String::from("dotnet test /p:UseSharedCompilation=true ");
+    cmdline.push_str(&get_base_output_path_arg());
+    cmdline.push_str(" --verbosity quiet -t");
+    if let Some(target) = target {
+        cmdline.push(' ');
+        cmdline.push_str(target);
+    }
+    if no_build {
+        cmdline.push_str(" --no-build");
+    }
+    if no_restore {
+        cmdline.push_str(" --no-restore");
+    }
+    discovery_log(format!("running: {cmdline}"));
+
+    let started = Instant::now();
     let output = cmd.output().context("Failed to run dotnet test -t")?;
+    discovery_log(format!(
+        "dotnet exited in {:.2}s (status: {})",
+        started.elapsed().as_secs_f64(),
+        output
+            .status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "signal".to_string())
+    ));
+
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let mut tests = Vec::new();
@@ -1077,8 +1177,10 @@ pub(crate) fn format_discovery_failure(
     no_restore: bool,
     target: Option<&str>,
 ) -> String {
-    let mut command =
-        format!("dotnet test /p:UseSharedCompilation=true {} -t", get_base_output_path_arg());
+    let mut command = format!(
+        "dotnet test /p:UseSharedCompilation=true {} --verbosity quiet -t",
+        get_base_output_path_arg()
+    );
     if let Some(target) = target {
         command.push(' ');
         command.push_str(target);

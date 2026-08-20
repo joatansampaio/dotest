@@ -72,7 +72,7 @@ Installed SDKs:
 
     assert!(message.contains("Test discovery failed while running `dotnet test /p:UseSharedCompilation=true /p:BaseOutputPath="));
     assert!(message.contains("bin/dotest/"));
-    assert!(message.contains("-t --no-build --no-restore`"));
+    assert!(message.contains("--verbosity quiet -t --no-build --no-restore`"));
     assert!(
         message.contains("The .NET SDK selected by global.json is not installed or cannot be used")
     );

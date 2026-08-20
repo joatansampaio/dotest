@@ -1280,7 +1280,7 @@ pub(super) fn run_interactive_loop(
                         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                     )),
                     Line::from("  Settings    : Saved in `.dotest.yml`"),
-                    Line::from("  Discovery   : Cached in `.dotest_cache.json` (skipped when fingerprint matches)"),
+                    Line::from("  Discovery   : Cached in `.dotest_cache.json` (scoped fingerprint over test projects)"),
                     Line::from("  Last run    : Results colors persist in `bin/dotest/last_run.json`"),
                     Line::from(""),
                     Line::from(Span::styled(

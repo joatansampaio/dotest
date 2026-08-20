@@ -58,6 +58,7 @@ fn resolve_churn_sidecar_command() -> Result<std::process::Command> {
     let project = churn_sidecar_dev_project_path();
     if project.is_file() {
         let mut cmd = std::process::Command::new("dotnet");
+        crate::core::executor::prepare_dotnet_command(&mut cmd);
         cmd.arg("run")
             .arg("--project")
             .arg(project)

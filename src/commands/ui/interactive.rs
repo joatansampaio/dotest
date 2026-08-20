@@ -63,6 +63,50 @@ const QUICK_CHURN_LIMIT: usize = 100;
 const CHURN_OUTPUT_TAIL_LINES: usize = 400;
 const CHURN_OUTPUT_OMITTED_MARKER: &str = "  ... older churn output omitted ...";
 
+/// Copy text to the system clipboard.
+///
+/// On Wayland, prefer `wl-copy` because arboard's native backend is unreliable
+/// across compositors (and can report success without the paste buffer sticking).
+fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            if copy_text_with_wl_copy(text).is_ok() {
+                return Ok(());
+            }
+        }
+    }
+
+    Clipboard::new()
+        .and_then(|mut cb| cb.set_text(text.to_owned()))
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn copy_text_with_wl_copy(text: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("wl-copy")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("wl-copy: {e}"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(text.as_bytes())
+            .map_err(|e| format!("wl-copy stdin: {e}"))?;
+    }
+
+    match child.wait() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!("wl-copy exited with {status}")),
+        Err(e) => Err(format!("wl-copy wait: {e}")),
+    }
+}
+
 fn churn_duration_stats_line(durations: &[Duration]) -> Option<String> {
     if durations.is_empty() {
         return None;
@@ -1986,8 +2030,8 @@ pub(super) fn run_interactive_loop(
                                         .map(|f| f.name.as_str())
                                         .collect::<Vec<_>>()
                                         .join("\n");
-                                    match Clipboard::new().and_then(|mut cb| cb.set_text(names)) {
-                                        Ok(_) => output_lines.push(
+                                    match copy_text_to_clipboard(&names) {
+                                        Ok(()) => output_lines.push(
                                             "✓ Copied failed test names to clipboard.".to_string(),
                                         ),
                                         Err(_) => output_lines.push(
@@ -2006,12 +2050,14 @@ pub(super) fn run_interactive_loop(
                                         s.push('\n');
                                         s.push_str(&f.details.join("\n"));
                                     }
-                                    match Clipboard::new().and_then(|mut c| c.set_text(s)) {
-                                    Ok(()) => output_lines
-                                        .push("✓ Copied selected failure (name + message) to clipboard.".to_string()),
-                                    Err(_) => output_lines
-                                        .push("✗ Could not copy to clipboard.".to_string()),
-                                }
+                                    match copy_text_to_clipboard(&s) {
+                                        Ok(()) => output_lines.push(
+                                            "✓ Copied selected failure (name + message) to clipboard."
+                                                .to_string(),
+                                        ),
+                                        Err(_) => output_lines
+                                            .push("✗ Could not copy to clipboard.".to_string()),
+                                    }
                                 }
                             }
                             KeyCode::Char('r') => {

@@ -6,6 +6,30 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
+/// Marker substring Cursor injects into `NUGET_PACKAGES` inside agent sandboxes.
+const CURSOR_SANDBOX_NUGET_MARKER: &str = "cursor-sandbox-cache";
+
+/// Strip Cursor sandbox NuGet redirects from a `dotnet` child process.
+///
+/// Agent sandboxes set `NUGET_PACKAGES` to an ephemeral `/tmp/cursor-sandbox-cache/...`
+/// path. A restore there writes absolute sandbox paths into `obj/project.assets.json`,
+/// and later builds fail with MSB3106/CS0006 once that cache disappears.
+pub fn prepare_dotnet_command(cmd: &mut Command) {
+    let poisoned = std::env::var_os("NUGET_PACKAGES").is_some_and(|value| {
+        value
+            .to_string_lossy()
+            .contains(CURSOR_SANDBOX_NUGET_MARKER)
+    });
+    if !poisoned {
+        return;
+    }
+
+    cmd.env_remove("NUGET_PACKAGES");
+    if let Some(home) = directories::UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) {
+        cmd.env("NUGET_PACKAGES", home.join(".nuget").join("packages"));
+    }
+}
+
 static SELECTED_TEST_TARGET: OnceLock<Option<String>> = OnceLock::new();
 static EXCLUDED_CATEGORY_FILTER: OnceLock<Option<String>> = OnceLock::new();
 
@@ -988,6 +1012,7 @@ fn discover_display_names(
     no_restore: bool,
 ) -> Result<Vec<String>> {
     let mut cmd = Command::new("dotnet");
+    prepare_dotnet_command(&mut cmd);
     cmd.arg("test")
         .arg("/p:UseSharedCompilation=true")
         .arg(get_base_output_path_arg())
@@ -1107,6 +1132,17 @@ Select a specific target from the prompt menu.",
 Disable \"Skip build\" for discovery/run or run a normal `dotnet test` once to produce test binaries.",
         );
     }
+    if combined.contains(CURSOR_SANDBOX_NUGET_MARKER)
+        || (combined.contains("MSB3106") && combined.contains("/tmp/cursor-sandbox-cache"))
+        || (combined.contains("CS0006") && combined.contains("/tmp/cursor-sandbox-cache"))
+    {
+        message.push_str(
+            "\n\nNuGet restore metadata points at Cursor's ephemeral sandbox package cache \
+(`/tmp/cursor-sandbox-cache/...`), which is missing. Delete the project's `obj` folder and run \
+`NUGET_PACKAGES=$HOME/.nuget/packages dotnet restore` outside the agent sandbox (or with full \
+permissions and `NUGET_PACKAGES` overridden to `$HOME/.nuget/packages`).",
+        );
+    }
     if combined.contains("error MSB3202")
         && combined.contains("project file")
         && combined.contains("was not found")
@@ -1176,6 +1212,7 @@ pub fn build_test_command_for_target(
     no_restore: bool,
 ) -> Command {
     let mut cmd = Command::new("dotnet");
+    prepare_dotnet_command(&mut cmd);
     cmd.arg("test")
         .arg("/p:UseSharedCompilation=true")
         .arg(get_base_output_path_arg());

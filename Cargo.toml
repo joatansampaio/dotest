@@ -14,7 +14,7 @@ anyhow = "1.0"
 ratatui = { version = "0.26", features = ["unstable-rendered-line-info"] }
 crossterm = "0.27"
 serde_yaml = "0.9.34"
-arboard = "3"
+arboard = { version = "3", features = ["wayland-data-control"] }
 notify = "6.1"
 sha2 = "0.10"
 libc = "0.2.185"

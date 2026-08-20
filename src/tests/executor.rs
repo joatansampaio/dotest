@@ -81,6 +81,18 @@ Installed SDKs:
 }
 
 #[test]
+fn test_discovery_failure_explains_cursor_sandbox_nuget_cache() {
+    let stderr = r#"CSC : error CS0006: Metadata file '/tmp/cursor-sandbox-cache/bf977db463d28938c5297916f0d50dfd/nuget/nunit/4.3.2/lib/net8.0/nunit.framework.dll' could not be found
+/usr/share/dotnet/sdk/9.0.315/Microsoft.Common.CurrentVersion.targets(2433,5): warning MSB3106: Assembly strong name "/tmp/cursor-sandbox-cache/bf977db463d28938c5297916f0d50dfd/nuget/nunit/4.3.2/lib/net8.0/nunit.framework.dll" is either a path which could not be found"#;
+
+    let message = format_discovery_failure(Some(1), "", stderr, false, true, None);
+
+    assert!(message.contains("ephemeral sandbox package cache"));
+    assert!(message.contains("Delete the project's `obj` folder"));
+    assert!(message.contains("NUGET_PACKAGES=$HOME/.nuget/packages dotnet restore"));
+}
+
+#[test]
 fn test_discovery_parsing_extracts_tests_even_with_noise_before_list() {
     let stdout = r#"Some build warning
 The following Tests are available:

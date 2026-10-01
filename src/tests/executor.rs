@@ -681,7 +681,10 @@ public class OrgTreeTests {
         .collect();
     let org_methods: Vec<_> = methods
         .iter()
-        .filter(|(_, vecs)| vecs.iter().any(|(_, qc, _)| qc_is_class(qc, "OrgTreeTests")))
+        .filter(|(_, vecs)| {
+            vecs.iter()
+                .any(|(_, qc, _)| qc_is_class(qc, "OrgTreeTests"))
+        })
         .collect();
 
     assert_eq!(
@@ -710,9 +713,17 @@ fn test_tree_test_count_for_parameterised_tests() {
     // - ParamTest has 5 instances ([TestCase] x5)
     // - AnotherTest has 3 instances
     let tests = vec![
-        DiscoveredTest::new("Folder.MyClass.SimpleTest", "Ns.Folder.MyClass.SimpleTest", 1),
+        DiscoveredTest::new(
+            "Folder.MyClass.SimpleTest",
+            "Ns.Folder.MyClass.SimpleTest",
+            1,
+        ),
         DiscoveredTest::new("Folder.MyClass.ParamTest", "Ns.Folder.MyClass.ParamTest", 5),
-        DiscoveredTest::new("Folder.MyClass.AnotherTest", "Ns.Folder.MyClass.AnotherTest", 3),
+        DiscoveredTest::new(
+            "Folder.MyClass.AnotherTest",
+            "Ns.Folder.MyClass.AnotherTest",
+            3,
+        ),
     ];
 
     let tree = build_flat_tree(&tests);

@@ -197,13 +197,19 @@ fn truncate_to_dot_segments(s: &str, max_segments: usize) -> String {
 /// Propagates selection state up the tree: a non-leaf is selected iff all its leaf descendants are selected.
 pub fn sync_parents(tree: &mut Vec<TreeNode>) {
     for i in (0..tree.len()).rev() {
-        if tree[i].is_leaf { continue; }
+        if tree[i].is_leaf {
+            continue;
+        }
         let mut any = false;
         let mut all = true;
         let mut j = i + 1;
         while j < tree.len() && tree[j].depth > tree[i].depth {
             if tree[j].is_leaf {
-                if tree[j].is_selected { any = true; } else { all = false; }
+                if tree[j].is_selected {
+                    any = true;
+                } else {
+                    all = false;
+                }
             }
             j += 1;
         }
@@ -240,7 +246,11 @@ impl TreeState {
             .filter(|n| !n.is_leaf && n.is_expanded)
             .filter_map(|n| n.fqn.clone())
             .collect();
-        Self { leaves, selected_groups, expanded }
+        Self {
+            leaves,
+            selected_groups,
+            expanded,
+        }
     }
 
     pub fn restore(&self, tree: &mut Vec<TreeNode>) {

@@ -52,6 +52,10 @@ fn default_confirm_exit_on_esc() -> bool {
     true
 }
 
+fn default_dump_test_logs() -> bool {
+    false
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct RunConfig {
     pub no_build: bool,
@@ -85,6 +89,10 @@ pub(crate) struct RunConfig {
     /// When true (default), pressing Esc to quit the app first opens a confirmation dialog.
     #[serde(default = "default_confirm_exit_on_esc")]
     pub confirm_exit_on_esc: bool,
+    /// When true, raw `dotnet test` / churn stdout+stderr are appended to `bin/dotest/test-output.log`.
+    /// Off by default; the stream pump skips all file I/O when disabled.
+    #[serde(default = "default_dump_test_logs")]
+    pub dump_test_logs: bool,
     #[serde(default)]
     pub presets: Vec<TestPreset>,
 }
@@ -103,6 +111,7 @@ impl Default for RunConfig {
             manual_watch_enabled: false,
             manual_watch_delay_ms: 2000,
             confirm_exit_on_esc: true,
+            dump_test_logs: false,
             presets: Vec::new(),
         }
     }

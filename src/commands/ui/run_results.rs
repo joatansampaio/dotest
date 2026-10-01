@@ -347,7 +347,10 @@ fn resolve_leaf_key(
 
     let leaves: Vec<&TreeNode> = tree.iter().filter(|n| n.is_leaf).collect();
 
-    if let Some(exact) = leaves.iter().find(|n| n.fqn.as_deref() == Some(key.as_str())) {
+    if let Some(exact) = leaves
+        .iter()
+        .find(|n| n.fqn.as_deref() == Some(key.as_str()))
+    {
         return exact.fqn.clone();
     }
 
@@ -364,11 +367,8 @@ fn resolve_leaf_key(
     match suffix_matches.as_slice() {
         [only] => only.fqn.clone(),
         [] => {
-            let label_matches: Vec<&TreeNode> = leaves
-                .iter()
-                .copied()
-                .filter(|n| n.label == key)
-                .collect();
+            let label_matches: Vec<&TreeNode> =
+                leaves.iter().copied().filter(|n| n.label == key).collect();
             match label_matches.as_slice() {
                 [only] => only.fqn.clone(),
                 many if !many.is_empty() => pick_among_homonyms(many, existing),
@@ -396,8 +396,7 @@ fn pick_among_homonyms(
         many => {
             // Running several selected homonyms: bind each result line to the next
             // selected leaf that still lacks an outcome.
-            many
-                .iter()
+            many.iter()
                 .find(|n| {
                     n.fqn
                         .as_deref()
@@ -453,14 +452,10 @@ mod tests {
     fn resolve_leaf_key_prefers_selected_when_short_names_collide() {
         // Same method name under Groups vs Placements — console often emits only the short name.
         // Longest-FQN guessing used to paint Placements when Groups was the one selected/run.
-        let groups =
-            "Tmly.Test.Groups.GroupQueryHandlerTest.CanLimitScopeUnderTmlyGroupId";
+        let groups = "Tmly.Test.Groups.GroupQueryHandlerTest.CanLimitScopeUnderTmlyGroupId";
         let placements =
             "Tmly.Test.Placements.PlacementQueryHandlerTests.CanLimitScopeUnderTmlyGroupId";
-        let tree = vec![
-            leaf(groups, true),
-            leaf(placements, false),
-        ];
+        let tree = vec![leaf(groups, true), leaf(placements, false)];
         let empty = HashMap::new();
 
         assert_eq!(
@@ -475,14 +470,10 @@ mod tests {
 
     #[test]
     fn ingest_line_attributes_short_name_to_selected_homonym() {
-        let groups =
-            "Tmly.Test.Groups.GroupQueryHandlerTest.CanLimitScopeUnderTmlyGroupId";
+        let groups = "Tmly.Test.Groups.GroupQueryHandlerTest.CanLimitScopeUnderTmlyGroupId";
         let placements =
             "Tmly.Test.Placements.PlacementQueryHandlerTests.CanLimitScopeUnderTmlyGroupId";
-        let tree = vec![
-            leaf(groups, true),
-            leaf(placements, false),
-        ];
+        let tree = vec![leaf(groups, true), leaf(placements, false)];
 
         let mut state = RunResultsState::default();
         state.ingest_line("Passed CanLimitScopeUnderTmlyGroupId [5 ms]", &tree);
@@ -496,14 +487,10 @@ mod tests {
 
     #[test]
     fn ingest_line_attributes_each_homonym_when_both_selected() {
-        let groups =
-            "Tmly.Test.Groups.GroupQueryHandlerTest.CanLimitScopeUnderTmlyGroupId";
+        let groups = "Tmly.Test.Groups.GroupQueryHandlerTest.CanLimitScopeUnderTmlyGroupId";
         let placements =
             "Tmly.Test.Placements.PlacementQueryHandlerTests.CanLimitScopeUnderTmlyGroupId";
-        let tree = vec![
-            leaf(groups, true),
-            leaf(placements, true),
-        ];
+        let tree = vec![leaf(groups, true), leaf(placements, true)];
 
         let mut state = RunResultsState::default();
         state.ingest_line("Passed CanLimitScopeUnderTmlyGroupId [5 ms]", &tree);
@@ -521,10 +508,7 @@ mod tests {
 
     #[test]
     fn resolve_leaf_key_unique_suffix_without_selection() {
-        let tree = vec![
-            leaf("Ns.A.Foo", false),
-            leaf("Ns.B.Bar", false),
-        ];
+        let tree = vec![leaf("Ns.A.Foo", false), leaf("Ns.B.Bar", false)];
         let empty = HashMap::new();
         assert_eq!(
             resolve_leaf_key(&tree, "Foo", &empty).as_deref(),

@@ -1,10 +1,11 @@
 use crate::core::executor::build_test_command_for_target;
 use anyhow::{Context, Result};
 use serde::Serialize;
-use std::io::Read;
-use std::path::Path;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -12,6 +13,8 @@ use super::config::{RunConfig, Verbosity};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+
+pub(super) const TEST_OUTPUT_LOG_PATH: &str = "bin/dotest/test-output.log";
 
 pub(super) enum OutputEvent {
     Line(String),
@@ -59,9 +62,14 @@ fn resolve_churn_sidecar_command() -> Result<std::process::Command> {
     if project.is_file() {
         let mut cmd = std::process::Command::new("dotnet");
         crate::core::executor::prepare_dotnet_command(&mut cmd);
+        // Use the sidecar directory so its global.json (SDK 8 + latestMajor) wins
+        // over a host repo that pins an older SDK.
+        if let Some(dir) = project.parent() {
+            cmd.current_dir(dir);
+        }
         cmd.arg("run")
             .arg("--project")
-            .arg(project)
+            .arg(&project)
             .arg("-v")
             .arg("q")
             .arg("--");
@@ -100,8 +108,12 @@ pub(super) fn spawn_test_run_for_target(
         _ => filter,
     };
 
-    let mut cmd =
-        build_test_command_for_target(target_override, filter_arg, config.no_build, config.no_restore);
+    let mut cmd = build_test_command_for_target(
+        target_override,
+        filter_arg,
+        config.no_build,
+        config.no_restore,
+    );
     cmd.arg("--nologo").arg("-v").arg("m");
 
     match config.verbosity {
@@ -124,9 +136,13 @@ pub(super) fn spawn_test_run_for_target(
 
     let tx2 = tx.clone();
     let tx3 = tx.clone();
+    // Only allocate/open a log file when dumping is enabled — off path stays allocation-free.
+    let log_file = open_test_log_writer(config.dump_test_logs, "dotnet test");
+    let log_stdout = log_file.clone();
+    let log_stderr = log_file;
 
-    thread::spawn(move || pump_stream_lines(stdout, tx));
-    thread::spawn(move || pump_stream_lines(stderr, tx2));
+    thread::spawn(move || pump_stream_lines(stdout, tx, log_stdout));
+    thread::spawn(move || pump_stream_lines(stderr, tx2, log_stderr));
     thread::spawn(move || {
         let code = child.wait().ok().and_then(|s| s.code());
         let _ = tx3.send(OutputEvent::Finished(code));
@@ -137,6 +153,7 @@ pub(super) fn spawn_test_run_for_target(
 
 pub(super) fn spawn_churn_sidecar(
     request: &ChurnSidecarRequest,
+    dump_test_logs: bool,
 ) -> Result<(mpsc::Receiver<OutputEvent>, u32)> {
     let (tx, rx) = mpsc::channel();
     let request_json = serde_json::to_vec(request)?;
@@ -149,8 +166,12 @@ pub(super) fn spawn_churn_sidecar(
         std::process::id(),
         request_stamp
     ));
-    std::fs::write(&request_path, request_json)
-        .with_context(|| format!("could not write sidecar request file at {}", request_path.display()))?;
+    std::fs::write(&request_path, request_json).with_context(|| {
+        format!(
+            "could not write sidecar request file at {}",
+            request_path.display()
+        )
+    })?;
 
     let mut cmd = resolve_churn_sidecar_command()?;
     cmd.arg("--request-file")
@@ -166,9 +187,12 @@ pub(super) fn spawn_churn_sidecar(
 
     let tx_stdout = tx.clone();
     let tx_stderr = tx.clone();
+    let log_file = open_test_log_writer(dump_test_logs, "churn sidecar");
+    let log_stdout = log_file.clone();
+    let log_stderr = log_file;
 
-    thread::spawn(move || pump_stream_lines(stdout, tx_stdout));
-    thread::spawn(move || pump_stream_lines(stderr, tx_stderr));
+    thread::spawn(move || pump_stream_lines(stdout, tx_stdout, log_stdout));
+    thread::spawn(move || pump_stream_lines(stderr, tx_stderr, log_stderr));
     thread::spawn(move || {
         let code = child.wait().ok().and_then(|s| s.code());
         let _ = std::fs::remove_file(&request_path);
@@ -178,18 +202,54 @@ pub(super) fn spawn_churn_sidecar(
     Ok((rx, pid))
 }
 
+/// Opens `bin/dotest/test-output.log` only when dumping is enabled.
+/// Returns `None` otherwise so the hot path does no file I/O.
+fn open_test_log_writer(enabled: bool, source: &str) -> Option<Arc<Mutex<File>>> {
+    if !enabled {
+        return None;
+    }
+    let path = PathBuf::from(TEST_OUTPUT_LOG_PATH);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ok()?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let _ = writeln!(file, "\n===== dotest {source} @ {stamp} =====");
+    let _ = file.flush();
+    Some(Arc::new(Mutex::new(file)))
+}
+
 // Reads a process stream as raw bytes and emits UI lines on both '\n' and '\r'.
 // We use this instead of `BufRead::lines()` because test runner/logging output
 // can contain carriage-return updates and partial chunks that are not reliably
 // surfaced with the previous technique of using .lines().flatten().
-fn pump_stream_lines<R: Read>(mut stream: R, tx: mpsc::Sender<OutputEvent>) {
+fn pump_stream_lines<R: Read>(
+    mut stream: R,
+    tx: mpsc::Sender<OutputEvent>,
+    log_file: Option<Arc<Mutex<File>>>,
+) {
     const READ_BUF_SIZE: usize = 4096;
     let mut buf = [0_u8; READ_BUF_SIZE];
     let mut pending: Vec<u8> = Vec::new();
     let mut prev_was_cr = false;
-    let emit_pending = |pending: &mut Vec<u8>, tx: &mpsc::Sender<OutputEvent>| {
+    let emit_pending = |pending: &mut Vec<u8>,
+                        tx: &mpsc::Sender<OutputEvent>,
+                        log_file: &Option<Arc<Mutex<File>>>| {
         let line = String::from_utf8_lossy(pending).into_owned();
         pending.clear();
+        // File write only when dumping was enabled at spawn (log_file is Some).
+        if let Some(file) = log_file {
+            if let Ok(mut guard) = file.lock() {
+                let _ = writeln!(guard, "{line}");
+            }
+        }
         tx.send(OutputEvent::Line(line)).is_ok()
     };
 
@@ -203,7 +263,7 @@ fn pump_stream_lines<R: Read>(mut stream: R, tx: mpsc::Sender<OutputEvent>) {
         for &byte in &buf[..read] {
             match byte {
                 b'\r' => {
-                    if !emit_pending(&mut pending, &tx) {
+                    if !emit_pending(&mut pending, &tx, &log_file) {
                         return;
                     }
                     prev_was_cr = true;
@@ -214,7 +274,7 @@ fn pump_stream_lines<R: Read>(mut stream: R, tx: mpsc::Sender<OutputEvent>) {
                         continue;
                     }
 
-                    if !emit_pending(&mut pending, &tx) {
+                    if !emit_pending(&mut pending, &tx, &log_file) {
                         return;
                     }
                 }
@@ -227,7 +287,7 @@ fn pump_stream_lines<R: Read>(mut stream: R, tx: mpsc::Sender<OutputEvent>) {
     }
 
     if !pending.is_empty() {
-        let _ = emit_pending(&mut pending, &tx);
+        let _ = emit_pending(&mut pending, &tx, &log_file);
     }
 }
 

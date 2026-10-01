@@ -13,9 +13,7 @@ pub fn sum_for_count_query(tests: &[DiscoveredTest], query: &str) -> usize {
     if q.contains('.') {
         tests
             .iter()
-            .filter(|test| {
-                test.filter_key == q || test.filter_key.starts_with(&format!("{}.", q))
-            })
+            .filter(|test| test.filter_key == q || test.filter_key.starts_with(&format!("{}.", q)))
             .map(|test| test.test_count)
             .sum()
     } else {
@@ -39,10 +37,7 @@ pub fn tree_under_prefix(tree: &str, prefix: &str) -> bool {
 }
 
 /// Resolve a short folder label (`Groups`, `Imports`) to the canonical first path segment from data.
-pub fn resolve_short_segment_to_prefix(
-    tests: &[DiscoveredTest],
-    segment: &str,
-) -> Option<String> {
+pub fn resolve_short_segment_to_prefix(tests: &[DiscoveredTest], segment: &str) -> Option<String> {
     let want = segment.trim();
     if want.is_empty() {
         return None;
@@ -79,7 +74,11 @@ mod tests {
     #[test]
     fn resolve_segment_finds_top_level_folder() {
         let tests = vec![
-            DiscoveredTest::new("Groups.OrgTreeTests.X", "Tmly.Test.Groups.OrgTreeTests.X", 1),
+            DiscoveredTest::new(
+                "Groups.OrgTreeTests.X",
+                "Tmly.Test.Groups.OrgTreeTests.X",
+                1,
+            ),
             DiscoveredTest::new("Imports.A.M", "Tmly.Test.Imports.A.M", 1),
         ];
         let p = resolve_short_segment_to_prefix(&tests, "Groups").unwrap();

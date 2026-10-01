@@ -1,5 +1,5 @@
 use crate::core::discovery::DiscoveredTest;
-use crate::core::executor::{compose_test_filter, discover_tests};
+use crate::core::executor::compose_test_filter;
 use crate::core::tree::{build_flat_tree, sync_parents, TreeNode, TreeState};
 use anyhow::Result;
 use arboard::Clipboard;
@@ -11,10 +11,10 @@ use super::failed_tests::{
     build_filter_for_display_names, extract_failed_tests, filter_key_for_vstest, FailedTestInfo,
 };
 use super::failure_summary::{
-    clamp_failed_summary_list_pane_cols, clicked_detail_index,
-    compute_failure_summary_list_pane_cols, compute_failure_detail_link_hover,
-    failed_detail_styled_line_with_hover, failed_summary_detail_rect, failed_summary_list_rect,
-    open_path_in_default_editor, parse_stack_trace_target,
+    clamp_failed_summary_list_pane_cols, clicked_detail_index, compute_failure_detail_link_hover,
+    compute_failure_summary_list_pane_cols, failed_detail_styled_line_with_hover,
+    failed_summary_detail_rect, failed_summary_list_rect, open_path_in_default_editor,
+    parse_stack_trace_target,
 };
 use super::manual_watch::{apply_manual_watch_config, ManualWatchHandle};
 use super::test_run::launch_filtered_test_run;
@@ -45,8 +45,8 @@ use super::layout::{
     centered_rect, format_elapsed, output_wrapped_scroll_max, styled_output_lines,
 };
 use super::output::{
-    kill_process, spawn_churn_sidecar, spawn_test_run_for_target, ChurnSidecarRequest,
-    OutputEvent,
+    kill_process, spawn_churn_sidecar, spawn_test_run_for_target, ChurnSidecarRequest, OutputEvent,
+    TEST_OUTPUT_LOG_PATH,
 };
 use super::presets::{apply_preset_selection, collect_selected_tests, save_preset};
 use super::run_results::{LeafStatus, RunResultsState};
@@ -169,8 +169,7 @@ fn trim_churn_output_lines(output_lines: &mut Vec<String>) {
 }
 
 fn clamp_tests_pane_rows(rows: u16, terminal_height: u16) -> u16 {
-    let max_tests_rows =
-        terminal_height.saturating_sub(STATUS_PANE_ROWS + MIN_OUTPUT_PANE_ROWS);
+    let max_tests_rows = terminal_height.saturating_sub(STATUS_PANE_ROWS + MIN_OUTPUT_PANE_ROWS);
     let min_tests_rows = MIN_TESTS_PANE_ROWS.min(max_tests_rows);
 
     rows.clamp(min_tests_rows, max_tests_rows)
@@ -187,8 +186,7 @@ fn split_output_constraints(
     tests_pane_rows: &mut Option<u16>,
     terminal_height: u16,
 ) -> Vec<Constraint> {
-    let rows = tests_pane_rows
-        .unwrap_or_else(|| default_tests_pane_rows(terminal_height));
+    let rows = tests_pane_rows.unwrap_or_else(|| default_tests_pane_rows(terminal_height));
     let rows = clamp_tests_pane_rows(rows, terminal_height);
     *tests_pane_rows = Some(rows);
 
@@ -197,6 +195,42 @@ fn split_output_constraints(
         Constraint::Min(MIN_OUTPUT_PANE_ROWS),
         Constraint::Length(STATUS_PANE_ROWS),
     ]
+}
+
+/// Y coordinate of the shared border between the Tests and Output panes (absolute).
+fn split_border_row(tests_pane_rows: Option<u16>, terminal_height: u16) -> u16 {
+    let rows = tests_pane_rows.unwrap_or_else(|| default_tests_pane_rows(terminal_height));
+    clamp_tests_pane_rows(rows, terminal_height).saturating_sub(1)
+}
+
+fn apply_tests_pane_resize(
+    tests_pane_rows: &mut Option<u16>,
+    run_config: &mut RunConfig,
+    terminal_height: u16,
+    delta_rows: i16,
+) {
+    let current = tests_pane_rows.unwrap_or_else(|| default_tests_pane_rows(terminal_height));
+    let next = if delta_rows.is_negative() {
+        current.saturating_sub(delta_rows.unsigned_abs())
+    } else {
+        current.saturating_add(delta_rows as u16)
+    };
+    let clamped = clamp_tests_pane_rows(next, terminal_height);
+    *tests_pane_rows = Some(clamped);
+    run_config.tests_pane_rows = Some(clamped);
+}
+
+fn apply_tests_pane_row_from_mouse(
+    tests_pane_rows: &mut Option<u16>,
+    run_config: &mut RunConfig,
+    terminal_height: u16,
+    mouse_row: u16,
+) {
+    // Border sits on the last row of the tests pane; mouse_row+1 ≈ desired tests height.
+    let desired = mouse_row.saturating_add(1);
+    let clamped = clamp_tests_pane_rows(desired, terminal_height);
+    *tests_pane_rows = Some(clamped);
+    run_config.tests_pane_rows = Some(clamped);
 }
 
 /// Interactive TUI: test tree, run output, settings, and failure summary.
@@ -223,6 +257,8 @@ pub(super) fn run_interactive_loop(
     let mut output_scroll: u16 = 0;
     let mut output_follow_tail = true;
     let mut tests_pane_rows: Option<u16> = run_config.tests_pane_rows;
+    // Dragging the Tests/Output split border with the mouse.
+    let mut dragging_split = false;
     let mut run_pid: Option<u32> = None;
     let mut run_start: Option<Instant> = None;
     let mut rediscovery_start: Option<Instant> = None;
@@ -242,14 +278,14 @@ pub(super) fn run_interactive_loop(
     let mut show_failure_summary_help = false;
     let mut failed_selection: usize = 0;
     let mut failed_detail_scroll: u16 = 0;
-    let mut failed_summary_list_pane_cols: Option<u16> =
-        run_config.failed_summary_list_pane_cols;
+    let mut failed_summary_list_pane_cols: Option<u16> = run_config.failed_summary_list_pane_cols;
     // Detail line index for stack links while the pointer is over that line in Error Details.
     let mut failure_detail_hover: Option<usize> = None;
 
     let mut show_config = false;
     // 0: skip build, 1: skip restore, 2: verbosity, 3: output,
-    // 4: view mode, 5: manual watch, 6: debounce, 7: confirm exit on Esc
+    // 4: view mode, 5: manual watch, 6: debounce, 7: confirm exit on Esc,
+    // 8: dump test logs
     let mut config_cursor: usize = 0;
     let mut show_exit_confirm = false;
     let mut show_help = false;
@@ -376,9 +412,7 @@ pub(super) fn run_interactive_loop(
                             }
 
                             let elapsed_duration = run_start.map(|s| s.elapsed());
-                            let elapsed = elapsed_duration
-                                .map(format_elapsed)
-                                .unwrap_or_default();
+                            let elapsed = elapsed_duration.map(format_elapsed).unwrap_or_default();
 
                             if let Some(d) = elapsed_duration {
                                 churn_durations.push(d);
@@ -432,8 +466,10 @@ pub(super) fn run_interactive_loop(
                                     run_passed = 0;
                                     run_failed = 0;
                                     run_skipped = 0;
-                                    output_lines
-                                        .push(format!("Iteration {}   ↻ Starting", churn_iteration));
+                                    output_lines.push(format!(
+                                        "Iteration {}   ↻ Starting",
+                                        churn_iteration
+                                    ));
                                     trim_churn_output_lines(&mut output_lines);
 
                                     let mut churn_run_config = run_config.clone();
@@ -509,7 +545,9 @@ pub(super) fn run_interactive_loop(
 
                                 let msg = match code {
                                     Some(c) => format!("  Last run exit code: {}", c),
-                                    None => "  Last run terminated without an exit code".to_string(),
+                                    None => {
+                                        "  Last run terminated without an exit code".to_string()
+                                    }
                                 };
                                 output_lines.push(msg);
                                 output_lines.push(
@@ -608,29 +646,47 @@ pub(super) fn run_interactive_loop(
                     search_query.clear();
                     run_results.prune_to_tree(tree);
                     let total: usize = tests.iter().map(|test| test.test_count).sum();
-                    output_lines.push(format!(
-                        "✓ Found {} tests ({} methods).",
-                        total,
-                        tests.len()
-                    ));
+                    // Live mode: replace rediscovery banner with a single result line.
+                    // Results mode: keep output_lines untouched so leaf/build panels don't jump.
+                    if run_config.view_mode == ViewMode::LiveOutput {
+                        output_lines.clear();
+                        output_lines.push(format!(
+                            "✓ Rediscovered {} tests ({} methods).",
+                            total,
+                            tests.len()
+                        ));
+                        output_follow_tail = true;
+                    }
                     is_rediscovering = false;
                     rediscovery_start = None;
                     rediscovery_rx = None;
+                    let _ = terminal.clear();
                 }
                 Ok(Err(error)) => {
-                    output_lines.push(format!("✗ Failed to discover tests: {error}"));
+                    if run_config.view_mode == ViewMode::LiveOutput {
+                        output_lines.clear();
+                        output_lines.push(format!("✗ Failed to discover tests: {error}"));
+                        output_follow_tail = true;
+                    }
                     is_rediscovering = false;
                     rediscovery_start = None;
                     rediscovery_rx = None;
                     rediscovery_sel = None;
+                    let _ = terminal.clear();
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    output_lines.push("✗ Failed to discover tests: worker stopped.".to_string());
+                    if run_config.view_mode == ViewMode::LiveOutput {
+                        output_lines.clear();
+                        output_lines
+                            .push("✗ Failed to discover tests: worker stopped.".to_string());
+                        output_follow_tail = true;
+                    }
                     is_rediscovering = false;
                     rediscovery_start = None;
                     rediscovery_rx = None;
                     rediscovery_sel = None;
+                    let _ = terminal.clear();
                 }
             }
         }
@@ -706,10 +762,12 @@ pub(super) fn run_interactive_loop(
             matches_query.fill(true);
         } else {
             for i in (0..tree.len()).rev() {
-                let mut matched = tree[i].label.to_lowercase().contains(&query) || match_abbrev(&search_query, &tree[i].label);
+                let mut matched = tree[i].label.to_lowercase().contains(&query)
+                    || match_abbrev(&search_query, &tree[i].label);
                 if !matched && tree[i].fqn.is_some() {
                     let fqn = tree[i].fqn.as_ref().unwrap();
-                    matched = fqn.to_lowercase().contains(&query) || match_abbrev(&search_query, fqn);
+                    matched =
+                        fqn.to_lowercase().contains(&query) || match_abbrev(&search_query, fqn);
                 }
                 if matched {
                     matches_query[i] = true;
@@ -782,34 +840,37 @@ pub(super) fn run_interactive_loop(
             results_panel_hidden = false;
         }
 
-        let results_leaf_lines: Option<Vec<String>> =
-            if run_config.view_mode == ViewMode::Results {
-                focused_leaf_fqn
-                    .as_deref()
-                    .filter(|fqn| run_results.get(fqn).is_some())
-                    .map(|fqn| run_results.leaf_panel_lines(fqn))
-            } else {
-                None
-            };
+        let results_leaf_lines: Option<Vec<String>> = if run_config.view_mode == ViewMode::Results {
+            focused_leaf_fqn
+                .as_deref()
+                .filter(|fqn| run_results.get(fqn).is_some())
+                .map(|fqn| run_results.leaf_panel_lines(fqn))
+        } else {
+            None
+        };
 
         // A build failure reports no test results at all, so Results mode has no leaf to
         // color or show. Fall back to the raw output so the compiler error stays visible.
         // `output_lines` is cleared on every launch, so this self-clears on the next run.
         let build_failed = run_passed + run_failed + run_skipped == 0
             && output_lines.iter().any(|l| {
-                l.contains(": error CS") || l.contains(": error MSB") || l.contains(": error NETSDK")
+                l.contains(": error CS")
+                    || l.contains(": error MSB")
+                    || l.contains(": error NETSDK")
             });
 
         let has_output = !output_lines.is_empty();
         let show_output_panel = match run_config.view_mode {
             ViewMode::LiveOutput => {
-                has_output
+                (has_output || is_rediscovering)
                     && (run_config.output_mode == OutputMode::Split || show_output_fullscreen)
             }
             ViewMode::Results => {
                 // Per-leaf details for the focused test (live during the run once that
                 // leaf has an outcome, and after the run finishes).
-                !results_panel_hidden
+                // Keep Results panels stable during F5 — rediscovery status lives in the status bar.
+                !is_rediscovering
+                    && !results_panel_hidden
                     && (build_failed
                         || results_leaf_lines
                             .as_ref()
@@ -832,9 +893,9 @@ pub(super) fn run_interactive_loop(
             let constraints = if show_output_fullscreen {
                 vec![Constraint::Min(0), Constraint::Length(STATUS_PANE_ROWS)]
             } else {
-                split_constraints.clone().unwrap_or_else(|| {
-                    split_output_constraints(&mut tests_pane_rows, area.height)
-                })
+                split_constraints
+                    .clone()
+                    .unwrap_or_else(|| split_output_constraints(&mut tests_pane_rows, area.height))
             };
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
@@ -973,7 +1034,7 @@ pub(super) fn run_interactive_loop(
                 let mut block = Block::default().title(title).borders(Borders::ALL);
                 if show_output_panel {
                     block = block.title(
-                        Title::from(" Ctrl+I/O ")
+                        Title::from(" drag split · Ctrl+↑/↓ ")
                             .alignment(Alignment::Right)
                             .position(Position::Bottom),
                     );
@@ -1133,7 +1194,7 @@ pub(super) fn run_interactive_loop(
             f.render_widget(help, chunks[help_chunk_idx]);
 
             if show_config {
-                let popup = centered_rect(78, 28, area);
+                let popup = centered_rect(78, 30, area);
                 f.render_widget(Clear, popup);
 
                 let v_label = match run_config.verbosity {
@@ -1179,6 +1240,10 @@ pub(super) fn run_interactive_loop(
                         "  {}  Confirm exit on Esc",
                         if run_config.confirm_exit_on_esc { "[x]" } else { "[ ]" }
                     ),
+                    format!(
+                        "  {}  Dump test logs → bin/dotest/test-output.log",
+                        if run_config.dump_test_logs { "[x]" } else { "[ ]" }
+                    ),
                 ];
                 for (i, line) in line_strings.iter().enumerate() {
                     let style = if i == config_cursor {
@@ -1198,6 +1263,10 @@ pub(super) fn run_interactive_loop(
                 )));
                 config_lines.push(Line::from(Span::styled(
                     "  Live = classic streaming log. Output layout mainly applies to Live.",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                config_lines.push(Line::from(Span::styled(
+                    "  Dump test logs is off by default (no file I/O when unchecked).",
                     Style::default().fg(Color::DarkGray),
                 )));
                 config_lines.push(Line::from(Span::styled(
@@ -1259,7 +1328,8 @@ pub(super) fn run_interactive_loop(
                         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                     )),
                     Line::from("  PgUp/PgDn, Home, End, mouse wheel : Scroll when the output panel is visible"),
-                    Line::from("  Ctrl+I / Ctrl+O : Move the Tests/Output split up or down (split layout)"),
+                    Line::from("  Drag split / Ctrl+↑ / Ctrl+↓ : Resize Tests vs Output (split layout)"),
+                    Line::from("                (Ctrl+I is Tab on most Linux terminals — use Ctrl+↑ instead)"),
                     Line::from("  Title shows [follow] (tail) vs [scroll] (manual)"),
                     Line::from("  Click a leaf    : Focus it (Results shows that test's output)"),
                     Line::from(""),
@@ -1267,7 +1337,7 @@ pub(super) fn run_interactive_loop(
                         " Shortcuts",
                         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                     )),
-                    Line::from("  Ctrl+P      : Settings (build, verbosity, view mode, watch, …)"),
+                    Line::from("  Ctrl+P      : Settings (build, verbosity, view mode, watch, dump logs, …)"),
                     Line::from("  Ctrl+W      : Toggle manual watch (● WATCH ON in the status bar)"),
                     Line::from("  Ctrl+S      : Save checked tests as a preset"),
                     Line::from("  Ctrl+L      : Open presets and run one"),
@@ -1280,7 +1350,8 @@ pub(super) fn run_interactive_loop(
                         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                     )),
                     Line::from("  Settings    : Saved in `.dotest.yml`"),
-                    Line::from("  Discovery   : Cached in `.dotest_cache.json` (scoped fingerprint over test projects)"),
+                    Line::from("  Discovery   : Cached in `.dotest_cache.json`. Unchanged projects are reused;"),
+                    Line::from("                only changed test projects are rediscovered."),
                     Line::from("  Last run    : Results colors persist in `bin/dotest/last_run.json`"),
                     Line::from(""),
                     Line::from(Span::styled(
@@ -1445,7 +1516,7 @@ pub(super) fn run_interactive_loop(
                     Block::default()
                         .title(" Failed Tests ")
                         .title(
-                            Title::from(" Ctrl+I/O ")
+                            Title::from(" drag · Ctrl+↑/↓ ")
                                 .alignment(Alignment::Right)
                                 .position(Position::Bottom),
                         )
@@ -1573,6 +1644,57 @@ pub(super) fn run_interactive_loop(
         if event::poll(std::time::Duration::from_millis(50))? {
             match event::read()? {
                 Event::Mouse(mouse) => {
+                    // Drag the Tests/Output split border to resize (Linux-friendly; Ctrl+I is Tab).
+                    if show_output_panel
+                        && !show_output_fullscreen
+                        && !show_failure_summary
+                        && !show_config
+                        && !show_help
+                        && !show_presets
+                        && !show_save_preset
+                        && !show_exit_confirm
+                    {
+                        let area = terminal.size()?;
+                        let border_row = split_border_row(tests_pane_rows, area.height);
+                        let near_split = mouse.row.abs_diff(border_row) <= 1;
+                        match mouse.kind {
+                            MouseEventKind::Down(MouseButton::Left) if near_split => {
+                                dragging_split = true;
+                                apply_tests_pane_row_from_mouse(
+                                    &mut tests_pane_rows,
+                                    &mut run_config,
+                                    area.height,
+                                    mouse.row,
+                                );
+                                continue;
+                            }
+                            MouseEventKind::Drag(MouseButton::Left) if dragging_split => {
+                                apply_tests_pane_row_from_mouse(
+                                    &mut tests_pane_rows,
+                                    &mut run_config,
+                                    area.height,
+                                    mouse.row,
+                                );
+                                continue;
+                            }
+                            MouseEventKind::Up(MouseButton::Left) if dragging_split => {
+                                dragging_split = false;
+                                run_config.save();
+                                continue;
+                            }
+                            _ => {
+                                if !matches!(
+                                    mouse.kind,
+                                    MouseEventKind::Drag(_) | MouseEventKind::Moved
+                                ) {
+                                    dragging_split = false;
+                                }
+                            }
+                        }
+                    } else if dragging_split {
+                        dragging_split = false;
+                    }
+
                     if show_failure_summary {
                         let area = terminal.size()?;
                         let failed_summary_list_cols = compute_failure_summary_list_pane_cols(
@@ -1932,9 +2054,18 @@ pub(super) fn run_interactive_loop(
                             {
                                 Some(-(PANE_RESIZE_STEP_ROWS as i16))
                             }
+                            KeyCode::Tab if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                Some(-(PANE_RESIZE_STEP_ROWS as i16))
+                            }
+                            KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                Some(-(PANE_RESIZE_STEP_ROWS as i16))
+                            }
                             KeyCode::Char('o' | 'O')
                                 if key.modifiers.contains(KeyModifiers::CONTROL) =>
                             {
+                                Some(PANE_RESIZE_STEP_ROWS as i16)
+                            }
+                            KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 Some(PANE_RESIZE_STEP_ROWS as i16)
                             }
                             _ => None,
@@ -1949,9 +2080,8 @@ pub(super) fn run_interactive_loop(
                             } else {
                                 current.saturating_add(delta as u16)
                             };
-                            failed_summary_list_pane_cols = Some(
-                                clamp_failed_summary_list_pane_cols(next, area.width),
-                            );
+                            failed_summary_list_pane_cols =
+                                Some(clamp_failed_summary_list_pane_cols(next, area.width));
                             continue;
                         }
 
@@ -2153,7 +2283,7 @@ pub(super) fn run_interactive_loop(
                                 }
                             }
                             KeyCode::Down => {
-                                if config_cursor < 7 {
+                                if config_cursor < 8 {
                                     config_cursor += 1;
                                 }
                             }
@@ -2215,6 +2345,16 @@ pub(super) fn run_interactive_loop(
                                     run_config.confirm_exit_on_esc =
                                         !run_config.confirm_exit_on_esc;
                                 }
+                                8 => {
+                                    run_config.dump_test_logs = !run_config.dump_test_logs;
+                                    if run_config.dump_test_logs {
+                                        output_lines.push(format!(
+                                            "✓ Dump test logs ON → {TEST_OUTPUT_LOG_PATH}"
+                                        ));
+                                    } else {
+                                        output_lines.push("○ Dump test logs OFF.".to_string());
+                                    }
+                                }
                                 _ => {}
                             },
                             _ => {}
@@ -2229,23 +2369,31 @@ pub(super) fn run_interactive_loop(
                             {
                                 Some(-(PANE_RESIZE_STEP_ROWS as i16))
                             }
+                            // Linux terminals usually map Ctrl+I → Tab; treat it the same.
+                            KeyCode::Tab if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                Some(-(PANE_RESIZE_STEP_ROWS as i16))
+                            }
+                            KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                Some(-(PANE_RESIZE_STEP_ROWS as i16))
+                            }
                             KeyCode::Char('o' | 'O')
                                 if key.modifiers.contains(KeyModifiers::CONTROL) =>
                             {
+                                Some(PANE_RESIZE_STEP_ROWS as i16)
+                            }
+                            KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 Some(PANE_RESIZE_STEP_ROWS as i16)
                             }
                             _ => None,
                         };
 
                         if let Some(delta) = resize_delta {
-                            let current = tests_pane_rows
-                                .unwrap_or_else(|| default_tests_pane_rows(area.height));
-                            let next = if delta.is_negative() {
-                                current.saturating_sub(delta.unsigned_abs())
-                            } else {
-                                current.saturating_add(delta as u16)
-                            };
-                            tests_pane_rows = Some(clamp_tests_pane_rows(next, area.height));
+                            apply_tests_pane_resize(
+                                &mut tests_pane_rows,
+                                &mut run_config,
+                                area.height,
+                                delta,
+                            );
                             continue;
                         }
                     }
@@ -2254,8 +2402,8 @@ pub(super) fn run_interactive_loop(
                         // Results mode keeps the tree as the main surface while tests run.
                         // Allow expand/collapse and selection movement so users can follow
                         // live pass/fail colors without waiting for the run to finish.
-                        let allow_tree_nav = run_config.view_mode == ViewMode::Results
-                            && !show_output_fullscreen;
+                        let allow_tree_nav =
+                            run_config.view_mode == ViewMode::Results && !show_output_fullscreen;
                         match key.code {
                             KeyCode::Char('x' | 'X') | KeyCode::Char('\u{18}')
                                 if key.modifiers.contains(KeyModifiers::CONTROL) =>
@@ -2526,7 +2674,7 @@ pub(super) fn run_interactive_loop(
                                     no_build: run_config.no_build,
                                     no_restore: run_config.no_restore,
                                 };
-                                spawn_churn_sidecar(&request)
+                                spawn_churn_sidecar(&request, run_config.dump_test_logs)
                             } else {
                                 churn_filter = Some(filter_str.clone());
                                 churn_using_sidecar = false;
@@ -2555,9 +2703,9 @@ pub(super) fn run_interactive_loop(
                                     run_failed = 0;
                                     run_skipped = 0;
                                     is_running = true;
-                                    show_output_fullscreen =
-                                        run_config.view_mode == ViewMode::LiveOutput
-                                            && run_config.output_mode == OutputMode::Fullscreen;
+                                    show_output_fullscreen = run_config.view_mode
+                                        == ViewMode::LiveOutput
+                                        && run_config.output_mode == OutputMode::Fullscreen;
                                 }
                                 Err(e) => {
                                     is_churning = false;
@@ -2651,35 +2799,35 @@ pub(super) fn run_interactive_loop(
 
                     if key.code == KeyCode::F(5) {
                         if is_rediscovering {
-                            output_lines.push("Rediscovery is already running.".to_string());
                             continue;
                         }
 
-                        output_lines.push(
-                            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                                .to_string(),
-                        );
-                        output_lines.push(
-                            "🔄 Rediscovering tests (building if needed)... please wait."
-                                .to_string(),
-                        );
-                        output_scroll = 0;
-                        output_follow_tail = true;
-                        show_output_fullscreen = run_config.view_mode == ViewMode::LiveOutput
-                            && run_config.output_mode == OutputMode::Fullscreen;
+                        // Live mode: show a single banner in the output panel.
+                        // Results mode: status bar only — do not append to output_lines
+                        // (that can flip on the build-failed panel and look like a duplicate UI).
+                        if run_config.view_mode == ViewMode::LiveOutput {
+                            output_lines.clear();
+                            output_lines.push(
+                                "🔄 Refreshing tests (unchanged projects stay cached)... please wait."
+                                    .to_string(),
+                            );
+                            output_scroll = 0;
+                            output_follow_tail = true;
+                            show_output_fullscreen =
+                                run_config.output_mode == OutputMode::Fullscreen;
+                        } else {
+                            show_output_fullscreen = false;
+                        }
                         is_rediscovering = true;
                         rediscovery_start = Some(Instant::now());
                         rediscovery_sel = Some(TreeState::capture(tree));
+                        dragging_split = false;
 
                         let no_restore = run_config.no_restore;
                         let (tx, rx) = mpsc::channel();
                         rediscovery_rx = Some(rx);
                         std::thread::spawn(move || {
-                            let result = discover_tests(false, no_restore)
-                                .map(|tests| {
-                                    let _ = super::discovery_cache::save_discovery_cache(&tests);
-                                    tests
-                                })
+                            let result = super::discover_using_cache(no_restore, false)
                                 .map_err(|e| e.to_string());
                             let _ = tx.send(result);
                         });
@@ -2877,17 +3025,25 @@ pub(super) fn run_interactive_loop(
 
 fn is_word_boundary(c: char, prev: Option<char>) -> bool {
     let Some(p) = prev else { return true };
-    if c.is_uppercase() && !p.is_uppercase() { return true; }
-    if c.is_numeric() && !p.is_numeric() { return true; }
-    if p == '_' || p == '.' || !p.is_alphanumeric() { return true; }
+    if c.is_uppercase() && !p.is_uppercase() {
+        return true;
+    }
+    if c.is_numeric() && !p.is_numeric() {
+        return true;
+    }
+    if p == '_' || p == '.' || !p.is_alphanumeric() {
+        return true;
+    }
     false
 }
 
 fn match_abbrev(query: &str, target: &str) -> bool {
-    if query.is_empty() { return true; }
+    if query.is_empty() {
+        return true;
+    }
     let q_chars: Vec<char> = query.chars().map(|c| c.to_ascii_lowercase()).collect();
     let t_chars: Vec<char> = target.chars().collect();
-    
+
     let mut boundaries = Vec::new();
     let mut prev = None;
     for (i, &c) in t_chars.iter().enumerate() {
@@ -2896,15 +3052,21 @@ fn match_abbrev(query: &str, target: &str) -> bool {
         }
         prev = Some(c);
     }
-    
-    fn dfs(q_idx: usize, b_idx: usize, q_chars: &[char], t_chars: &[char], boundaries: &[usize]) -> bool {
+
+    fn dfs(
+        q_idx: usize,
+        b_idx: usize,
+        q_chars: &[char],
+        t_chars: &[char],
+        boundaries: &[usize],
+    ) -> bool {
         if q_idx == q_chars.len() {
             return true;
         }
         if b_idx == boundaries.len() {
             return false;
         }
-        
+
         let start = boundaries[b_idx];
         let mut matched = 0;
         while q_idx + matched < q_chars.len() && start + matched < t_chars.len() {
@@ -2917,10 +3079,10 @@ fn match_abbrev(query: &str, target: &str) -> bool {
                 break;
             }
         }
-        
+
         dfs(q_idx, b_idx + 1, q_chars, t_chars, boundaries)
     }
-    
+
     dfs(0, 0, &q_chars, &t_chars, &boundaries)
 }
 
@@ -2935,7 +3097,7 @@ mod search_tests {
         assert!(match_abbrev("MUR", target));
         assert!(match_abbrev("muro", target));
         assert!(!match_abbrev("MoveunfiRollupZ", target));
-        
+
         let target2 = "Namespace.Class.Method";
         assert!(match_abbrev("NCM", target2));
         assert!(match_abbrev("NaClMe", target2));

@@ -198,8 +198,7 @@ mod tests {
 
     #[test]
     fn build_filter_keeps_both_homonyms_runnable_when_both_selected() {
-        let groups =
-            "Tmly.Test.Groups.GroupQueryHandlerTest.CanLimitScopeUnderTmlyGroupId";
+        let groups = "Tmly.Test.Groups.GroupQueryHandlerTest.CanLimitScopeUnderTmlyGroupId";
         let placements =
             "Tmly.Test.Placements.PlacementQueryHandlerTests.CanLimitScopeUnderTmlyGroupId";
         let other = "Tmly.Test.Other.SomeTest.DoesSomethingElse";

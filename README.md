@@ -121,6 +121,7 @@ When hitting **Ctrl+P**, `dotest` opens a settings modal allowing you to persist
 
 - **Skip build:** Avoids recompiling on test runs.
 - **Verbosity Modes:** Lets you manage the amount of `dotnet test` logs piped to the output pane without cluttering MSBuild output.
-- **Discovery cache:** The test list is saved in `.dotest_cache.json`. On the next launch, `dotest` skips `dotnet test -t` when a scoped fingerprint of your test projects (plus shallow solution/config files) matches. Use **F5** to rediscover and refresh the cache. Timing lines are printed to stderr with the `[discovery]` prefix.
+- **Dump test logs:** When enabled, appends raw `dotnet test` / churn stdout+stderr to `bin/dotest/test-output.log`. Off by default (no file I/O when disabled).
+- **Discovery cache:** The test list is saved in `.dotest_cache.json` and reused when test projects are unchanged. Editing tests in one project rediscovers only that project (`dotnet test -t`); the other projects stay as the last correct list. A solution, `Directory.Build.*`, or NuGet config change rediscovers everything. **F5** follows the same rules. Optional timing: `DOTEST_DISCOVERY_TIMING=1` writes `.dotest_discovery.log`.
 
 All of these UI settings are saved persistently into `.dotest.yml` in your current directory.

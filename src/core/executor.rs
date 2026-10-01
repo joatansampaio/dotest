@@ -1,15 +1,11 @@
 use crate::core::config::Config;
-use crate::core::discovery::DiscoveredTest;
+use crate::core::discovery::{discovery_log, DiscoveredTest};
 use anyhow::{bail, Context, Result};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Instant;
-
-fn discovery_log(msg: impl AsRef<str>) {
-    eprintln!("[discovery] {}", msg.as_ref());
-}
 
 /// Marker substring Cursor injects into `NUGET_PACKAGES` inside agent sandboxes.
 const CURSOR_SANDBOX_NUGET_MARKER: &str = "cursor-sandbox-cache";
@@ -86,11 +82,54 @@ pub fn discover_tests(no_build: bool, no_restore: bool) -> Result<Vec<Discovered
         test_projects.len()
     ));
 
+    let stamp = (test_projects.len() == 1).then(|| test_projects[0].target_path.as_str());
+    let entries = entries_from_projects(&display_names, &test_projects, stamp);
+    discovery_log(format!(
+        "done in {:.2}s total",
+        total.elapsed().as_secs_f64()
+    ));
+    Ok(entries)
+}
+
+/// Rediscover only the given test projects and return their tests.
+/// Each entry is stamped with its project path so later runs can reuse the rest of the list.
+pub fn discover_tests_for_targets(
+    targets: &[String],
+    no_build: bool,
+    no_restore: bool,
+) -> Result<Vec<DiscoveredTest>> {
+    let mut out = Vec::new();
+    for target in targets {
+        let stage = Instant::now();
+        discovery_log(format!(
+            "incremental project {target} (no_build={no_build}, no_restore={no_restore})"
+        ));
+        let display_names = discover_display_names(Some(target.as_str()), no_build, no_restore)?;
+        discovery_log(format!(
+            "incremental {target}: dotnet test -t {:.2}s → {} display name(s)",
+            stage.elapsed().as_secs_f64(),
+            display_names.len()
+        ));
+        if display_names.is_empty() {
+            continue;
+        }
+        let projects = find_test_projects(Path::new("."), Some(target));
+        let entries = entries_from_projects(&display_names, &projects, Some(target.as_str()));
+        out.extend(entries);
+    }
+    Ok(out)
+}
+
+fn entries_from_projects(
+    display_names: &[String],
+    projects: &[TestProject],
+    stamp_target: Option<&str>,
+) -> Vec<DiscoveredTest> {
     let stage = Instant::now();
     let mut method_map: HashMap<String, Vec<SourceMethod>> = HashMap::new();
     let mut class_map = HashMap::new();
     let mut cs_files = 0usize;
-    for project in &test_projects {
+    for project in projects {
         let (m, c, files) = scan_source_maps(&project.root, &project.target_path);
         cs_files += files;
         for (k, mut v) in m {
@@ -110,17 +149,20 @@ pub fn discover_tests(no_build: bool, no_restore: bool) -> Result<Vec<Discovered
     ));
 
     let stage = Instant::now();
-    let entries = build_discovery_entries(&display_names, &method_map, &class_map);
+    let mut entries = build_discovery_entries(display_names, &method_map, &class_map);
+    if let Some(target) = stamp_target {
+        for entry in &mut entries {
+            if entry.target_path.as_deref().unwrap_or("").is_empty() {
+                entry.target_path = Some(target.to_string());
+            }
+        }
+    }
     discovery_log(format!(
         "build_discovery_entries: {:.2}s → {} discovered test(s)",
         stage.elapsed().as_secs_f64(),
         entries.len()
     ));
-    discovery_log(format!(
-        "done in {:.2}s total",
-        total.elapsed().as_secs_f64()
-    ));
-    Ok(entries)
+    entries
 }
 
 /// Maps each `dotnet test -t` line to a source method, merges counts, and builds vstest filter keys.
@@ -409,6 +451,11 @@ pub(crate) fn enrich(
 /// Returns (method_map, class_map, cs_file_count):
 ///   method_map: short_method_name -> [(relative_folder, qualified_class_name), ...]
 ///   class_map:  simple class_name  -> relative_folder
+struct ParsedSources {
+    methods: HashMap<String, Vec<SourceMethod>>,
+    classes: HashMap<String, String>,
+}
+
 fn scan_source_maps(
     root: &Path,
     target_path: &str,
@@ -417,30 +464,39 @@ fn scan_source_maps(
     HashMap<String, String>,
     usize,
 ) {
-    let mut method_map: HashMap<String, Vec<SourceMethod>> = HashMap::new();
-    let mut class_map: HashMap<String, String> = HashMap::new();
-    let mut cs_files = 0usize;
-    walk_cs(
-        root,
-        root,
-        target_path,
-        &mut method_map,
-        &mut class_map,
-        &mut cs_files,
-        0,
-    );
-    (method_map, class_map, cs_files)
+    let mut files = Vec::new();
+    collect_cs_files(root, root, &mut files, 0);
+    let cs_files = files.len();
+    if files.is_empty() {
+        return (HashMap::new(), HashMap::new(), 0);
+    }
+
+    // Small trees are faster single-threaded. Larger ones parse file-by-file in parallel,
+    // then merge in path order so class-folder ties stay deterministic.
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 8);
+    let parsed = if threads == 1 || files.len() < 48 {
+        parse_cs_list(&files, target_path)
+    } else {
+        let chunk_size = files.len().div_ceil(threads);
+        let mut partials = Vec::new();
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for chunk in files.chunks(chunk_size) {
+                handles.push(scope.spawn(move || parse_cs_list(chunk, target_path)));
+            }
+            for handle in handles {
+                partials.push(handle.join().expect("source scan thread panicked"));
+            }
+        });
+        merge_parsed(partials)
+    };
+    (parsed.methods, parsed.classes, cs_files)
 }
 
-fn walk_cs(
-    root: &Path,
-    dir: &Path,
-    target_path: &str,
-    methods: &mut HashMap<String, Vec<SourceMethod>>,
-    classes: &mut HashMap<String, String>,
-    cs_files: &mut usize,
-    depth: usize,
-) {
+fn collect_cs_files(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, String)>, depth: usize) {
     if depth > 10 {
         return;
     }
@@ -448,31 +504,47 @@ fn walk_cs(
         Ok(r) => r,
         Err(_) => return,
     };
-    for entry in rd.flatten() {
+    let mut entries: Vec<_> = rd.flatten().collect();
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
         let path = entry.path();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if path.is_dir() {
             if name.starts_with('.') || name == "obj" || name == "bin" {
                 continue;
             }
-            walk_cs(
-                root,
-                &path,
-                target_path,
-                methods,
-                classes,
-                cs_files,
-                depth + 1,
-            );
+            collect_cs_files(root, &path, out, depth + 1);
         } else if name.ends_with(".cs") {
-            *cs_files += 1;
             let rel = path.parent().unwrap_or(root);
             let rel = rel.strip_prefix(root).unwrap_or(rel);
             let dir_str = rel.to_string_lossy().replace('\\', ".").replace('/', ".");
             let dir_str = dir_str.trim_matches('.').to_string();
-            parse_cs_file(&path, &dir_str, target_path, methods, classes);
+            out.push((path, dir_str));
         }
     }
+}
+
+fn parse_cs_list(files: &[(PathBuf, String)], target_path: &str) -> ParsedSources {
+    let mut methods = HashMap::new();
+    let mut classes = HashMap::new();
+    for (path, dir_str) in files {
+        parse_cs_file(path, dir_str, target_path, &mut methods, &mut classes);
+    }
+    ParsedSources { methods, classes }
+}
+
+fn merge_parsed(partials: Vec<ParsedSources>) -> ParsedSources {
+    let mut methods: HashMap<String, Vec<SourceMethod>> = HashMap::new();
+    let mut classes: HashMap<String, String> = HashMap::new();
+    for partial in partials {
+        for (name, mut found) in partial.methods {
+            methods.entry(name).or_default().append(&mut found);
+        }
+        for (class_name, folder) in partial.classes {
+            classes.entry(class_name).or_insert(folder);
+        }
+    }
+    ParsedSources { methods, classes }
 }
 
 fn parse_cs_file(
@@ -551,14 +623,11 @@ fn parse_cs_content_with_target(
                     } else {
                         format!("{}.{}", namespace, cls)
                     };
-                    methods
-                        .entry(method_name)
-                        .or_default()
-                        .push((
-                            dir_str.to_string(),
-                            qualified,
-                            target_path.to_string(),
-                        ));
+                    methods.entry(method_name).or_default().push((
+                        dir_str.to_string(),
+                        qualified,
+                        target_path.to_string(),
+                    ));
                 }
             }
             has_test_attr = false;

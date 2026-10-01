@@ -453,9 +453,12 @@ internal static class Program
 
 	private static string FindVstestConsolePath()
 	{
+		var minimumSdk = new Version(8, 0);
 		var roots = new[]
 			{
 				Environment.GetEnvironmentVariable("DOTNET_ROOT"),
+				"/usr/share/dotnet",
+				"/usr/lib/dotnet",
 				Path.Combine(
 					Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
 					"dotnet"
@@ -493,6 +496,11 @@ internal static class Program
 					version = new Version(0, 0);
 				}
 
+				if (version < minimumSdk)
+				{
+					continue;
+				}
+
 				candidates.Add((version, directoryName.Contains('-'), vstestPath));
 			}
 		}
@@ -504,7 +512,9 @@ internal static class Program
 
 		if (string.IsNullOrWhiteSpace(best.Path))
 		{
-			throw new InvalidOperationException("Could not locate vstest.console.dll in the installed .NET SDK.");
+			throw new InvalidOperationException(
+				"Could not locate vstest.console.dll from a .NET SDK 8.0 or newer. Install the .NET 8+ SDK."
+			);
 		}
 
 		return best.Path;

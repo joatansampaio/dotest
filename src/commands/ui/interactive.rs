@@ -17,6 +17,7 @@ use super::failure_summary::{
     parse_stack_trace_target,
 };
 use super::manual_watch::{apply_manual_watch_config, ManualWatchHandle};
+use super::test_metrics::{format_duration_ms, TestMetrics, TEST_METRICS_PATH};
 use super::test_run::launch_filtered_test_run;
 
 use crossterm::{
@@ -105,6 +106,109 @@ fn copy_text_with_wl_copy(text: &str) -> Result<(), String> {
         Ok(status) => Err(format!("wl-copy exited with {status}")),
         Err(e) => Err(format!("wl-copy wait: {e}")),
     }
+}
+
+fn commit_test_metrics(metrics: &mut TestMetrics, save: bool, output_lines: &mut Vec<String>) {
+    if !metrics.mark_finished() {
+        return;
+    }
+    if !save {
+        return;
+    }
+    match metrics.save() {
+        Ok(()) => output_lines.push(format!("  Test metrics saved → {TEST_METRICS_PATH}")),
+        Err(err) => output_lines.push(format!("  ✗ Could not save test metrics: {err}")),
+    }
+}
+
+fn metrics_popup_size(area_width: u16, area_height: u16) -> (u16, u16) {
+    let width = area_width
+        .saturating_sub(4)
+        .clamp(40, 120)
+        .min(area_width.max(1));
+    let height = area_height
+        .saturating_sub(4)
+        .clamp(12, 40)
+        .min(area_height.max(1));
+    (width, height)
+}
+
+fn metrics_popup_inner_rows(area_height: u16) -> u16 {
+    let (_, height) = metrics_popup_size(80, area_height);
+    height.saturating_sub(2)
+}
+
+fn metrics_overlay_lines(metrics: &TestMetrics) -> Vec<Line<'static>> {
+    let ranked = metrics.ranked();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if !metrics.is_finished() {
+        lines.push(Line::from(""));
+        lines.push(Line::from("  No completed run yet."));
+        lines.push(Line::from(
+            "  Finish a test run, then press Ctrl+T to rank durations.",
+        ));
+    } else if ranked.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from("  This run did not report per-test durations."));
+        lines.push(Line::from(
+            "  Set log verbosity to Normal or Detailed in Settings (Ctrl+P).",
+        ));
+        lines.push(Line::from(
+            "  Minimal verbosity omits the [duration] suffix on each test.",
+        ));
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {} tests   total {}   slowest first",
+                ranked.len(),
+                format_duration_ms(metrics.total_ms())
+            ),
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {:>4}  {:<12}  {:<7}  {}",
+                "#", "Duration", "Status", "Test"
+            ),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for (i, row) in ranked.iter().enumerate() {
+            let status_style = match row.status.as_str() {
+                "Failed" => Style::default().fg(Color::Red),
+                "Skipped" => Style::default().fg(Color::Yellow),
+                _ => Style::default().fg(Color::Green),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {:>4}  ", i + 1),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    format!("{:<12}  ", format_duration_ms(row.duration_ms)),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled(format!("{:<7}  ", row.status), status_style),
+                Span::raw(row.name.clone()),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  ↑/↓ PgUp/PgDn Home/End scroll   Esc / Enter close",
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines
+}
+
+fn clamp_metrics_scroll(scroll: u16, metrics: &TestMetrics, area_height: u16) -> u16 {
+    let inner = metrics_popup_inner_rows(area_height);
+    let max = metrics_overlay_lines(metrics)
+        .len()
+        .saturating_sub(inner as usize)
+        .min(u16::MAX as usize) as u16;
+    scroll.min(max)
 }
 
 fn churn_duration_stats_line(durations: &[Duration]) -> Option<String> {
@@ -285,8 +389,11 @@ pub(super) fn run_interactive_loop(
     let mut show_config = false;
     // 0: skip build, 1: skip restore, 2: verbosity, 3: output,
     // 4: view mode, 5: manual watch, 6: debounce, 7: confirm exit on Esc,
-    // 8: dump test logs
+    // 8: dump test logs, 9: save test metrics
     let mut config_cursor: usize = 0;
+    let mut test_metrics = TestMetrics::default();
+    let mut show_test_metrics = false;
+    let mut metrics_scroll: u16 = 0;
     let mut show_exit_confirm = false;
     let mut show_help = false;
     let mut show_output_fullscreen = false;
@@ -378,6 +485,7 @@ pub(super) fn run_interactive_loop(
                             && parse_churn_iteration_failed_line(trimmed).is_none()
                         {
                             run_results.ingest_line(&line, tree);
+                            test_metrics.ingest_line(&line);
                         }
 
                         output_lines.push(line);
@@ -408,6 +516,11 @@ pub(super) fn run_interactive_loop(
                                 churn_filter = None;
                                 churn_limit = None;
                                 churn_target_path = None;
+                                commit_test_metrics(
+                                    &mut test_metrics,
+                                    run_config.save_test_metrics,
+                                    &mut output_lines,
+                                );
                                 continue;
                             }
 
@@ -461,6 +574,11 @@ pub(super) fn run_interactive_loop(
                                     churn_limit = None;
                                     churn_target_path = None;
                                     churn_using_sidecar = false;
+                                    commit_test_metrics(
+                                        &mut test_metrics,
+                                        run_config.save_test_metrics,
+                                        &mut output_lines,
+                                    );
                                 } else if let Some(filter) = churn_filter.clone() {
                                     churn_iteration += 1;
                                     run_passed = 0;
@@ -502,6 +620,11 @@ pub(super) fn run_interactive_loop(
                                             churn_limit = None;
                                             churn_target_path = None;
                                             churn_using_sidecar = false;
+                                            commit_test_metrics(
+                                                &mut test_metrics,
+                                                run_config.save_test_metrics,
+                                                &mut output_lines,
+                                            );
                                         }
                                     }
                                 } else {
@@ -516,6 +639,11 @@ pub(super) fn run_interactive_loop(
                                     churn_target_path = None;
                                     churn_limit = None;
                                     churn_using_sidecar = false;
+                                    commit_test_metrics(
+                                        &mut test_metrics,
+                                        run_config.save_test_metrics,
+                                        &mut output_lines,
+                                    );
                                 }
                             } else {
                                 is_running = false;
@@ -567,6 +695,11 @@ pub(super) fn run_interactive_loop(
                                 churn_limit = None;
                                 churn_target_path = None;
                                 churn_using_sidecar = false;
+                                commit_test_metrics(
+                                    &mut test_metrics,
+                                    run_config.save_test_metrics,
+                                    &mut output_lines,
+                                );
                             }
                         } else {
                             is_running = false;
@@ -616,6 +749,11 @@ pub(super) fn run_interactive_loop(
                             run_results.save();
                             results_panel_hidden = false;
                             run_pid = None;
+                            commit_test_metrics(
+                                &mut test_metrics,
+                                run_config.save_test_metrics,
+                                &mut output_lines,
+                            );
                         }
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
@@ -627,6 +765,11 @@ pub(super) fn run_interactive_loop(
                                 .unwrap_or_default();
                             output_lines.push(format!("✓ Process finished ({})", elapsed));
                             run_pid = None;
+                            commit_test_metrics(
+                                &mut test_metrics,
+                                run_config.save_test_metrics,
+                                &mut output_lines,
+                            );
                         }
                         break;
                     }
@@ -704,6 +847,7 @@ pub(super) fn run_interactive_loop(
                 && !show_help
                 && !show_save_preset
                 && !show_presets
+                && !show_test_metrics
             {
                 if show_failure_summary {
                     show_failure_summary = false;
@@ -750,6 +894,8 @@ pub(super) fn run_interactive_loop(
                             &mut show_output_fullscreen,
                             &mut run_results,
                             &mut results_panel_hidden,
+                            &mut test_metrics,
+                            &mut show_test_metrics,
                         );
                     }
                 }
@@ -1131,7 +1277,7 @@ pub(super) fn run_interactive_loop(
                 )
             } else if show_output_fullscreen {
                 format!(
-                    " Fullscreen output  |  PgUp/PgDn/Home/End/mouse: scroll  Esc: back to tree{}{}",
+                    " Fullscreen output  |  PgUp/PgDn/Home/End/mouse: scroll  Ctrl+T: timings  Esc: back to tree{}{}",
                     watch_hint, view_hint
                 )
             } else if !search_query.is_empty() {
@@ -1178,7 +1324,7 @@ pub(super) fn run_interactive_loop(
                     text.push_str(watch_hint);
                 }
                 text.push_str(view_hint);
-                text.push_str("  Ctrl+S: preset  Ctrl+L: presets  Ctrl+E: failed ");
+                text.push_str("  Ctrl+S: preset  Ctrl+L: presets  Ctrl+E: failed  Ctrl+T: timings ");
                 text.push_str(" ?: help  Esc: quit ");
                 text
             };
@@ -1194,7 +1340,7 @@ pub(super) fn run_interactive_loop(
             f.render_widget(help, chunks[help_chunk_idx]);
 
             if show_config {
-                let popup = centered_rect(78, 30, area);
+                let popup = centered_rect(78, 34, area);
                 f.render_widget(Clear, popup);
 
                 let v_label = match run_config.verbosity {
@@ -1244,6 +1390,10 @@ pub(super) fn run_interactive_loop(
                         "  {}  Dump test logs → bin/dotest/test-output.log",
                         if run_config.dump_test_logs { "[x]" } else { "[ ]" }
                     ),
+                    format!(
+                        "  {}  Save test metrics → {TEST_METRICS_PATH}",
+                        if run_config.save_test_metrics { "[x]" } else { "[ ]" }
+                    ),
                 ];
                 for (i, line) in line_strings.iter().enumerate() {
                     let style = if i == config_cursor {
@@ -1270,6 +1420,10 @@ pub(super) fn run_interactive_loop(
                     Style::default().fg(Color::DarkGray),
                 )));
                 config_lines.push(Line::from(Span::styled(
+                    "  Ctrl+T ranks durations after a run. Save test metrics writes that list to a file.",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                config_lines.push(Line::from(Span::styled(
                     "  ↑/↓ move  ·  Space change  ·  ←/→ debounce  ·  Esc / Enter save & close",
                     Style::default().fg(Color::DarkGray),
                 )));
@@ -1287,7 +1441,7 @@ pub(super) fn run_interactive_loop(
             }
 
             if show_help {
-                let popup = centered_rect(88, 48, area);
+                let popup = centered_rect(88, 52, area);
                 f.render_widget(Clear, popup);
 
                 let help_lines = vec![
@@ -1337,11 +1491,12 @@ pub(super) fn run_interactive_loop(
                         " Shortcuts",
                         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                     )),
-                    Line::from("  Ctrl+P      : Settings (build, verbosity, view mode, watch, dump logs, …)"),
+                    Line::from("  Ctrl+P      : Settings (build, verbosity, view mode, watch, metrics, …)"),
                     Line::from("  Ctrl+W      : Toggle manual watch (● WATCH ON in the status bar)"),
                     Line::from("  Ctrl+S      : Save checked tests as a preset"),
                     Line::from("  Ctrl+L      : Open presets and run one"),
                     Line::from("  Ctrl+E      : Failed-tests summary (fills as failures arrive)"),
+                    Line::from("  Ctrl+T      : Test durations, slowest first (after a run finishes)"),
                     Line::from("  F5          : Rediscover tests and refresh the tree/cache"),
                     Line::from("  F1 / ?      : Open this help"),
                     Line::from(""),
@@ -1353,6 +1508,7 @@ pub(super) fn run_interactive_loop(
                     Line::from("  Discovery   : Cached in `.dotest_cache.json`. Unchanged projects are reused;"),
                     Line::from("                only changed test projects are rediscovered."),
                     Line::from("  Last run    : Results colors persist in `bin/dotest/last_run.json`"),
+                    Line::from("  Metrics     : Optional ranking file at `bin/dotest/test-metrics.txt`"),
                     Line::from(""),
                     Line::from(Span::styled(
                         " Manual watch",
@@ -1639,11 +1795,44 @@ pub(super) fn run_interactive_loop(
                 );
                 f.render_widget(confirm_widget, popup);
             }
+
+            if show_test_metrics {
+                let (width, height) = metrics_popup_size(area.width, area.height);
+                let popup = centered_rect(width, height, area);
+                f.render_widget(Clear, popup);
+                let lines = metrics_overlay_lines(&test_metrics);
+                let scroll = clamp_metrics_scroll(metrics_scroll, &test_metrics, area.height);
+                let widget = Paragraph::new(lines)
+                    .block(
+                        Block::default()
+                            .title(" Test durations (Ctrl+T) ")
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::Cyan)),
+                    )
+                    .wrap(Wrap { trim: false })
+                    .scroll((scroll, 0));
+                f.render_widget(widget, popup);
+            }
         })?;
 
         if event::poll(std::time::Duration::from_millis(50))? {
             match event::read()? {
                 Event::Mouse(mouse) => {
+                    if show_test_metrics {
+                        let area = terminal.size()?;
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp => {
+                                metrics_scroll = metrics_scroll.saturating_sub(3);
+                            }
+                            MouseEventKind::ScrollDown => {
+                                metrics_scroll = metrics_scroll.saturating_add(3);
+                            }
+                            _ => {}
+                        }
+                        metrics_scroll =
+                            clamp_metrics_scroll(metrics_scroll, &test_metrics, area.height);
+                        continue;
+                    }
                     // Drag the Tests/Output split border to resize (Linux-friendly; Ctrl+I is Tab).
                     if show_output_panel
                         && !show_output_fullscreen
@@ -1653,6 +1842,7 @@ pub(super) fn run_interactive_loop(
                         && !show_presets
                         && !show_save_preset
                         && !show_exit_confirm
+                        && !show_test_metrics
                     {
                         let area = terminal.size()?;
                         let border_row = split_border_row(tests_pane_rows, area.height);
@@ -1832,6 +2022,7 @@ pub(super) fn run_interactive_loop(
                         && !show_presets
                         && !show_save_preset
                         && !show_exit_confirm
+                        && !show_test_metrics
                     {
                         let tree_constraints = if show_output_panel {
                             split_constraints.clone().unwrap_or_else(|| {
@@ -2026,6 +2217,8 @@ pub(super) fn run_interactive_loop(
                                             &mut show_output_fullscreen,
                                             &mut run_results,
                                             &mut results_panel_hidden,
+                                            &mut test_metrics,
+                                            &mut show_test_metrics,
                                         );
                                     }
                                     show_presets = false;
@@ -2036,7 +2229,46 @@ pub(super) fn run_interactive_loop(
                         continue;
                     }
 
+                    if show_test_metrics {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Enter => {
+                                show_test_metrics = false;
+                            }
+                            KeyCode::Up => {
+                                metrics_scroll = metrics_scroll.saturating_sub(1);
+                            }
+                            KeyCode::Down => {
+                                metrics_scroll = metrics_scroll.saturating_add(1);
+                            }
+                            KeyCode::PageUp => {
+                                metrics_scroll = metrics_scroll.saturating_sub(10);
+                            }
+                            KeyCode::PageDown => {
+                                metrics_scroll = metrics_scroll.saturating_add(10);
+                            }
+                            KeyCode::Home => {
+                                metrics_scroll = 0;
+                            }
+                            KeyCode::End => {
+                                metrics_scroll = u16::MAX;
+                            }
+                            _ => {}
+                        }
+                        let area = terminal.size()?;
+                        metrics_scroll =
+                            clamp_metrics_scroll(metrics_scroll, &test_metrics, area.height);
+                        continue;
+                    }
+
                     if show_failure_summary {
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && matches!(key.code, KeyCode::Char('t' | 'T'))
+                            && !is_running
+                        {
+                            show_test_metrics = true;
+                            metrics_scroll = 0;
+                            continue;
+                        }
                         if show_failure_summary_help {
                             match key.code {
                                 KeyCode::Char('?') | KeyCode::Esc | KeyCode::Enter => {
@@ -2222,6 +2454,8 @@ pub(super) fn run_interactive_loop(
                                         &mut show_output_fullscreen,
                                         &mut run_results,
                                         &mut results_panel_hidden,
+                                        &mut test_metrics,
+                                        &mut show_test_metrics,
                                     );
                                 }
                             }
@@ -2255,6 +2489,8 @@ pub(super) fn run_interactive_loop(
                                         &mut show_output_fullscreen,
                                         &mut run_results,
                                         &mut results_panel_hidden,
+                                        &mut test_metrics,
+                                        &mut show_test_metrics,
                                     );
                                 }
                             }
@@ -2283,7 +2519,7 @@ pub(super) fn run_interactive_loop(
                                 }
                             }
                             KeyCode::Down => {
-                                if config_cursor < 8 {
+                                if config_cursor < 9 {
                                     config_cursor += 1;
                                 }
                             }
@@ -2353,6 +2589,27 @@ pub(super) fn run_interactive_loop(
                                         ));
                                     } else {
                                         output_lines.push("○ Dump test logs OFF.".to_string());
+                                    }
+                                }
+                                9 => {
+                                    run_config.save_test_metrics = !run_config.save_test_metrics;
+                                    if run_config.save_test_metrics {
+                                        if test_metrics.is_finished() {
+                                            match test_metrics.save() {
+                                                Ok(()) => output_lines.push(format!(
+                                                    "✓ Save test metrics ON → {TEST_METRICS_PATH}"
+                                                )),
+                                                Err(err) => output_lines.push(format!(
+                                                    "✗ Save test metrics ON, but the file could not be written: {err}"
+                                                )),
+                                            }
+                                        } else {
+                                            output_lines.push(format!(
+                                                "✓ Save test metrics ON → {TEST_METRICS_PATH} (written after the next run)"
+                                            ));
+                                        }
+                                    } else {
+                                        output_lines.push("○ Save test metrics OFF.".to_string());
                                     }
                                 }
                                 _ => {}
@@ -2525,9 +2782,23 @@ pub(super) fn run_interactive_loop(
                                 churn_target_path = None;
                                 churn_using_sidecar = false;
                                 output_rx = None;
+                                commit_test_metrics(
+                                    &mut test_metrics,
+                                    run_config.save_test_metrics,
+                                    &mut output_lines,
+                                );
                             }
                             _ => {}
                         }
+                        continue;
+                    }
+
+                    if !is_running
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                        && matches!(key.code, KeyCode::Char('t' | 'T'))
+                    {
+                        show_test_metrics = true;
+                        metrics_scroll = 0;
                         continue;
                     }
 
@@ -2706,6 +2977,9 @@ pub(super) fn run_interactive_loop(
                                     show_output_fullscreen = run_config.view_mode
                                         == ViewMode::LiveOutput
                                         && run_config.output_mode == OutputMode::Fullscreen;
+                                    test_metrics.clear();
+                                    show_test_metrics = false;
+                                    metrics_scroll = 0;
                                 }
                                 Err(e) => {
                                     is_churning = false;
@@ -2915,6 +3189,8 @@ pub(super) fn run_interactive_loop(
                                     &mut show_output_fullscreen,
                                     &mut run_results,
                                     &mut results_panel_hidden,
+                                    &mut test_metrics,
+                                    &mut show_test_metrics,
                                 );
                             }
                         }

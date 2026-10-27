@@ -56,6 +56,10 @@ fn default_dump_test_logs() -> bool {
     false
 }
 
+fn default_save_test_metrics() -> bool {
+    false
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct RunConfig {
     pub no_build: bool,
@@ -93,6 +97,10 @@ pub(crate) struct RunConfig {
     /// Off by default; the stream pump skips all file I/O when disabled.
     #[serde(default = "default_dump_test_logs")]
     pub dump_test_logs: bool,
+    /// When true, each finished run writes per-test durations (slowest first) to
+    /// `bin/dotest/test-metrics.txt`. The Ctrl+T overlay does not depend on this flag.
+    #[serde(default = "default_save_test_metrics")]
+    pub save_test_metrics: bool,
     #[serde(default)]
     pub presets: Vec<TestPreset>,
 }
@@ -112,6 +120,7 @@ impl Default for RunConfig {
             manual_watch_delay_ms: 2000,
             confirm_exit_on_esc: true,
             dump_test_logs: false,
+            save_test_metrics: false,
             presets: Vec::new(),
         }
     }

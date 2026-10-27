@@ -7,6 +7,7 @@ use super::config::{OutputMode, RunConfig, ViewMode};
 use super::failed_tests::FailedTestInfo;
 use super::output::{spawn_test_run, OutputEvent};
 use super::run_results::RunResultsState;
+use super::test_metrics::TestMetrics;
 
 /// Shared by Enter, manual watch, and failed-test reruns. `filter` is the
 /// `FullyQualifiedName~…` string from `build_filter` (empty = run all).
@@ -32,6 +33,8 @@ pub(crate) fn launch_filtered_test_run(
     show_output_fullscreen: &mut bool,
     run_results: &mut RunResultsState,
     results_panel_hidden: &mut bool,
+    test_metrics: &mut TestMetrics,
+    show_test_metrics: &mut bool,
 ) {
     // Live Output still wants fullscreen when configured; Results mode never auto-opens
     // the global stream panel.
@@ -61,6 +64,8 @@ pub(crate) fn launch_filtered_test_run(
             // Clear stale colors; refill as lines arrive.
             run_results.clear();
             *results_panel_hidden = false;
+            test_metrics.clear();
+            *show_test_metrics = false;
         }
         Err(e) => {
             output_lines.push(format!("Error: {e}"));

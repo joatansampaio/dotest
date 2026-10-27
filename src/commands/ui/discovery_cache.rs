@@ -25,6 +25,10 @@ const MAX_INCREMENTAL_PROJECTS: usize = 3;
 
 pub(crate) const CACHE_PATH: &str = ".dotest_cache.json";
 
+/// Bump when discovery output shape changes so a stale list (for example a root
+/// `Validate` leaf) is not reused after the parser fix.
+const DISCOVERY_CACHE_VERSION: u32 = 2;
+
 #[derive(Serialize, Deserialize)]
 struct DiscoveryCacheFile {
     fingerprint: String,
@@ -42,6 +46,8 @@ struct DiscoveryCacheFile {
     /// Per test-project content fingerprint, keyed by relative `.csproj` path.
     #[serde(default)]
     project_fingerprints: BTreeMap<String, String>,
+    #[serde(default)]
+    discovery_version: u32,
 }
 
 /// Previous correct discovery, detailed enough to refresh only what changed.
@@ -375,6 +381,13 @@ pub(crate) fn load_cache() -> LoadedCache {
         discovery_log("cache: miss (empty tests list)");
         return LoadedCache::Missing;
     }
+    if file.discovery_version != DISCOVERY_CACHE_VERSION {
+        discovery_log(format!(
+            "cache: miss (discovery version {} != {DISCOVERY_CACHE_VERSION})",
+            file.discovery_version
+        ));
+        return LoadedCache::Missing;
+    }
     if file.solution_fingerprint.is_empty() || file.project_fingerprints.is_empty() {
         return LoadedCache::Legacy {
             tests: file.tests,
@@ -509,6 +522,7 @@ pub(crate) fn save_discovery_cache_tracking(
         fingerprint_roots: roots.clone(),
         solution_fingerprint,
         project_fingerprints,
+        discovery_version: DISCOVERY_CACHE_VERSION,
     };
     let s = serde_json::to_string(&file).context("serialize discovery cache")?;
     fs::write(CACHE_PATH, s).context("write discovery cache")?;

@@ -582,6 +582,8 @@ fn parse_cs_content_with_target(
     let mut current_class: Option<String> = None;
     let mut has_test_attr = false;
     let mut namespace = String::new();
+    // `[TestCase( ... )]` may span lines. While it is open, those lines are not methods.
+    let mut attr_depth: i32 = 0;
 
     for line in content.lines() {
         let trimmed = line.trim();
@@ -589,18 +591,30 @@ fn parse_cs_content_with_target(
             continue;
         }
 
-        if let Some(ns) = extract_namespace_declaration(trimmed) {
+        let started_inside_attribute = attr_depth > 0;
+        let stripped = if started_inside_attribute || trimmed.starts_with('[') {
+            if is_test_attribute(trimmed) || opens_test_attribute(trimmed) {
+                has_test_attr = true;
+            }
+            attr_depth = (attr_depth + attribute_bracket_delta(trimmed)).max(0);
+            // A later line of the same attribute (or an attribute that is still open)
+            // must not be parsed as the test method. That was dropping `Validate`
+            // and leaving a root leaf named after the method.
+            if attr_depth > 0 || started_inside_attribute {
+                continue;
+            }
+            let stripped = strip_attributes(trimmed);
+            if stripped.is_empty() || stripped.starts_with("//") {
+                continue;
+            }
+            stripped
+        } else if let Some(ns) = extract_namespace_declaration(trimmed) {
             namespace = ns;
             continue;
-        }
+        } else {
+            strip_attributes(trimmed)
+        };
 
-        let stripped = strip_attributes(trimmed);
-
-        if is_test_attribute(trimmed) {
-            has_test_attr = true;
-        }
-
-        // Track class declarations
         if let Some(cls) = extract_class_name(stripped) {
             current_class = Some(cls.clone());
             classes.entry(cls).or_insert_with(|| dir_str.to_string());
@@ -608,11 +622,7 @@ fn parse_cs_content_with_target(
         }
 
         if has_test_attr {
-            if stripped.is_empty() {
-                continue;
-            }
-            // Skip comment-only remainders (e.g. [Test] // url  ->  stripped = "// url")
-            if stripped.starts_with("//") {
+            if stripped.is_empty() || stripped.starts_with("//") {
                 continue;
             }
 
@@ -673,6 +683,61 @@ pub(crate) fn strip_attributes(mut s: &str) -> &str {
         }
     }
     s
+}
+
+/// `[` / `]` outside string literals. Used to keep a multi-line attribute open.
+fn attribute_bracket_delta(line: &str) -> i32 {
+    let mut delta = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    for c in line.chars() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if c == '\\' && in_string {
+            escape = true;
+            continue;
+        }
+        if c == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if in_string {
+            continue;
+        }
+        match c {
+            '[' => delta += 1,
+            ']' => delta -= 1,
+            _ => {}
+        }
+    }
+    delta
+}
+
+/// True when a line opens a test attribute, even if the closing `]` is on a later line.
+fn opens_test_attribute(line: &str) -> bool {
+    let Some(rest) = line.trim().strip_prefix('[') else {
+        return false;
+    };
+    let rest = rest.trim().to_ascii_lowercase();
+    const KEYWORDS: &[&str] = &[
+        "test",
+        "testcase",
+        "testcasesource",
+        "fact",
+        "theory",
+        "datarow",
+        "testmethod",
+    ];
+    KEYWORDS.iter().any(|kw| {
+        rest == *kw
+            || rest.starts_with(&format!("{kw}("))
+            || rest.starts_with(&format!("{kw} "))
+            || rest.starts_with(&format!("{kw},"))
+            || rest.starts_with(&format!("{kw}]"))
+            || rest.starts_with(&format!("{kw}["))
+    })
 }
 
 pub(crate) fn is_test_attribute(line: &str) -> bool {

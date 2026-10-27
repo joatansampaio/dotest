@@ -36,6 +36,45 @@ fn test_build_discovery_parametric_collapses_to_one_row() {
     assert_eq!(out[0].test_count, 3);
 }
 
+/// `EmailValidatorTest.Validate` is a long `[TestCase]` list. One case is split across lines,
+/// and discovery was emitting a root leaf named `Validate` (count = number of cases)
+/// instead of `Common.EmailValidatorTest.Validate`.
+#[test]
+fn email_validator_multiline_testcase_is_not_a_root_validate_leaf() {
+    let content = r#"
+namespace Tmly.Test.Common {
+    public class EmailValidatorTest {
+        [TestCase("a@b.co", true)]
+        [TestCase("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" +
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" +
+                "@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" +
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.com")]
+        public void Validate(string email, bool expected = false) {
+        }
+    }
+}
+"#;
+    let mut methods = HashMap::new();
+    let mut classes = HashMap::new();
+    parse_cs_content(content, "Common", &mut methods, &mut classes);
+    let display_names = vec![
+        "Validate(\"a@b.co\",True)".to_string(),
+        "Validate(\"overflow\")".to_string(),
+    ];
+    let out = build_discovery_entries(&display_names, &methods, &classes);
+    assert_eq!(out.len(), 1);
+    assert_eq!(
+        out[0].tree_path, "Common.EmailValidatorTest.Validate",
+        "Validate must sit under its folder and class, not at the tree root (got filter_key {})",
+        out[0].filter_key
+    );
+    assert_eq!(
+        out[0].filter_key,
+        "Tmly.Test.Common.EmailValidatorTest.Validate"
+    );
+    assert_eq!(out[0].test_count, 2);
+}
+
 /// UTF-8 BOM before `namespace` must not hide the namespace (Visual Studio default for new files).
 #[test]
 fn test_parse_cs_content_utf8_bom_before_namespace() {
